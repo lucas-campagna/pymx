@@ -1,0 +1,66 @@
+/^(?P<name>[a-zA-Z][a-zA-Z0-9]*)=$/(exec): $name = $default
+
+import(exec): |
+  assert(type($default) )
+  for key, value in $default.items():
+    if type(value) == list:
+      exec(f"from {key} import {value.join(', ')}")
+    elif type(value) == None:
+      exec(f"import {key}")
+    elif type(value) == str:
+      exec(f"import {key} as {value}")
+    else:
+      raise "Invalid value for import"
+  
+    
+Cell1(import):
+  matplotlib.pyplot: plt # import matplotlib.pyplot as plt
+  pandas: pd # import pandas as pd
+  numpy: null # import numpy
+  sklearn.linear_model: [LinearRegression, LogRegression] # from sklearn.linear_model import LinearRegression, LogRegression
+
+
+# Calls pd.read_csv and stores in variable df
+Cell2(pd.read_csv|df=): my_data.csv
+
+
+/(?P<func>\w+)\?/(exec): |
+  try:
+    return func($args)
+  except:
+    return $args
+
+/(?P<model>[A-Z][a-zA-Z0-9]*)Model/(merge|$model):
+  tol: 1e-4
+  n_jobs: 8
+
+a: {a: $default, b: $args}
+# a applies $args and $default to its body and returns
+
+x(a): 123 # -> { "a": 123, "b": null }
+# x calls a with args: null, default: 123
+
+y(x): 456
+# y calls x with default: 456
+
+a(b): 1
+b(c): $0 + 1
+c: $0 + 1
+
+# a = lambda: b(default=1)
+# b = lambda default: c(default=default+1)
+# c = lambda default: default + 1
+# a() -> 3
+#
+
+<name>(a|b|c...): body
+# def <name>(body, *args, **kwargs):
+#   result = parse(body, *args, **kwargs)
+#   for func in ...:
+#     result = func(**result)
+#       if type(result) == dict else
+#       func(*result)
+#       if type(result) == list else
+#       func(result)
+#
+#   return result

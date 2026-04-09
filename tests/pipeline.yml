@@ -1,0 +1,4 @@
+a(b): 1
+b(c): $default + 1
+c: $default + 1
+result: 3

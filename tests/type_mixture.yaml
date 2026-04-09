@@ -1,0 +1,21 @@
+main(comp_a):
+  a: 1
+  b: 2
+
+comp_a(comp_b):
+  c: 3
+
+comp_b(comp_c): $a + $b + $c
+
+comp_c(exec|comp_d): $default + 4
+
+comp_d(comp_e):
+  - $default
+  - 20
+
+comp_e(comp_f):
+  - 30
+
+comp_f(exec): $default[0] == 10 && sum($default[1:]) == 50
+
+result: true

@@ -1,0 +1,5 @@
+main(child):
+  x: 2
+  y: 3
+child: $x + $y
+result: 5

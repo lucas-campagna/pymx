@@ -1,0 +1,6 @@
+main(sorted):
+  - 3
+  - 2
+  - 1
+
+result: [1,2,3]

@@ -1,0 +1,9 @@
+main(exec|sum): |
+  def sumFn(a, b):
+    return a + b
+
+sum(sumFn):
+  a: 123
+  b: 456
+
+result: 579

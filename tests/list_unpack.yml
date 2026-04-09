@@ -1,0 +1,5 @@
+main(child):
+  - 2
+  - 3
+child: $0 + $1
+result: 5
