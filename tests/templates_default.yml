@@ -1,9 +1,6 @@
-main(exec):
+main(comp_inc):
   - 10
 
 comp_inc(exec): '$default + 1'
-
-inc(comp_inc):
-  - $default
 
 result: 11
