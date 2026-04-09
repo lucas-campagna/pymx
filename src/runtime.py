@@ -33,11 +33,31 @@ def compile_namespace(components: Dict[str, Component]) -> Dict[str, Any]:
         [
             "def __invoke_child(func, value):",
             "    if func is exec:",
+            "        # Execute provided code and try to return any newly-defined",
+            "        # callable so it can be directly passed as an argument (eg a",
+            "        # key function to sorted). If nothing callable was defined,",
+            "        # fall back to returning the original value.",
             "        if isinstance(value, str):",
+            "            before = set(globals().keys())",
             "            exec(value, globals())",
+            "            after = set(globals().keys())",
+            "            created = [n for n in after - before if callable(globals().get(n))]",
+            "            if len(created) == 1:",
+            "                return globals()[created[0]]",
+            "            try:",
+            "                ev = eval(value, globals())",
+            "                if callable(ev):",
+            "                    return ev",
+            "            except Exception:",
+            "                pass",
             "            return value",
             "        if isinstance(value, dict) and 'code' in value:",
+            "            before = set(globals().keys())",
             "            exec(value['code'], globals())",
+            "            after = set(globals().keys())",
+            "            created = [n for n in after - before if callable(globals().get(n))]",
+            "            if len(created) == 1:",
+            "                return globals()[created[0]]",
             "            return value",
             "        return value",
             "",
@@ -47,8 +67,58 @@ def compile_namespace(components: Dict[str, Component]) -> Dict[str, Any]:
             "        name = getattr(func, '__name__', '')",
             "        if getattr(func, '__is_dsl_component', False) or name.startswith('__comp_'):",
             "            return func(value)",
-            "        return func(**value)",
+            "        try:",
+            "            return func(**value)",
+            "        except TypeError:",
+            "            # Some builtins (like sorted) have a positional-only 'iterable'",
+            "            # parameter. If passing as keywords fails, try calling with the",
+            "            # iterable as the first positional argument and the rest as kws.",
+            "            if 'iterable' in value:",
+            "                iterable = value['iterable']",
+            "                other = {k: v for k, v in value.items() if k != 'iterable'}",
+            "                return func(iterable, **other)",
+            "            # If dict has a single entry, try passing it as the positional arg",
+            "            if len(value) == 1:",
+            "                only = next(iter(value.values()))",
+            "                return func(only)",
+            "            raise",
             "    return func(value)",
+            "",
+        ]
+    )
+
+    # Helper to convert a non-callable 'key' value into a callable key function
+    # when appropriate. This supports cases where the DSL provides a literal
+    # ordering (list/tuple) or a string representation of one — we turn that
+    # into a key function that maps items to their index in the provided order.
+    code_lines.extend(
+        [
+            "def __ensure_key_callable(v):",
+            "    try:",
+            "        import ast",
+            "        lit = None",
+            "        if isinstance(v, str):",
+            "            try:",
+            "                lit = ast.literal_eval(v)",
+            "            except Exception:",
+            "                lit = None",
+            "        else:",
+            "            lit = v",
+            "        if isinstance(lit, (list, tuple)):",
+            "            index = {}",
+            "            for i, item in enumerate(lit):",
+            "                try:",
+            "                    keyt = tuple(item) if isinstance(item, (list, tuple)) else item",
+            "                except Exception:",
+            "                    keyt = item",
+            "                index[keyt] = i",
+            "            def _key(x):",
+            "                xt = tuple(x) if isinstance(x, (list, tuple)) else x",
+            "                return index.get(xt, float('inf'))",
+            "            return _key",
+            "    except Exception:",
+            "        pass",
+            "    return v",
             "",
         ]
     )
@@ -101,7 +171,16 @@ def compile_namespace(components: Dict[str, Component]) -> Dict[str, Any]:
                 )
                 code_lines.append("    d.update({")
                 for k, v in lit.items():
-                    code_lines.append(f"        {repr(k)}: {_expr_for_value(v)},")
+                    # Support keys that embed a child invocation, e.g. key(exec): ...
+                    m = re.match(r"^([A-Za-z_]\w*)\(([^)]+)\)$", k)
+                    if m:
+                        key_name = m.group(1)
+                        child = m.group(2)
+                        code_lines.append(
+                            f"        {repr(key_name)}: __ensure_key_callable(__invoke_child(globals().get('__comp_{child}', {child}), {_expr_for_value(v)})),"
+                        )
+                    else:
+                        code_lines.append(f"        {repr(k)}: {_expr_for_value(v)},")
                 code_lines.append("    })")
                 code_lines.append("    return d")
                 code_lines.append("")
