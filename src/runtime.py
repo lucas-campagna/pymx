@@ -495,6 +495,14 @@ def compile_namespace(components: Dict[str, Component]) -> Dict[str, Any]:
                             "    # numeric placeholders were encoded as {n0},{n1} etc.\n"
                             "    # ensure tpl2 uses the n-prefixed names for any numeric fields"
                         )
+                        # The 'n' prefix is used to avoid Python's str.format positional
+                        # field parsing for numeric field names. A bare '{0}' is treated
+                        # as a positional index by str.format(), but we need to call
+                        # format_map(mapping) with named keys. Encoding numeric
+                        # placeholders as '{n0}' lets us store their values under the
+                        # mapping key 'n0' and still have format_map() substitute
+                        # them as named fields. At runtime we resolve 'n0' via
+                        # __deref_index('0', ...).
                         code_lines.append("    mapping = {}")
                         code_lines.append("    for _k in keys:")
                         code_lines.append("        if _k == 'default':")
