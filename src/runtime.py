@@ -123,6 +123,49 @@ def compile_namespace(components: Dict[str, Component]) -> Dict[str, Any]:
         ]
     )
 
+    # Build a list of regex-backed components (pattern -> __comp_name)
+    code_lines.append("import re")
+    code_lines.append("__re_components = []")
+    for cname, cobj in components.items():
+        if getattr(cobj, "pattern", None):
+            code_lines.append(
+                f"__re_components.append((re.compile(r{repr(cobj.pattern)}), '__comp_{cname}'))"
+            )
+
+    # Lookup helper: resolves a child name to a callable. It first prefers a
+    # compiled component named __comp_<name>, then a top-level callable by that
+    # name, and finally attempts to match regex-backed components. When a
+    # regex component matches, it returns a small wrapper that injects the
+    # captured groups into the child's default dict before invoking the
+    # matched component.
+    code_lines.append("def __lookup_child(name):")
+    code_lines.append("    # direct compiled component")
+    code_lines.append("    c = globals().get('__comp_' + name)")
+    code_lines.append("    if c is not None:")
+    code_lines.append("        return c")
+    code_lines.append("    # top-level callable (e.g., builtins like sorted)")
+    code_lines.append("    t = globals().get(name)")
+    code_lines.append("    if callable(t):")
+    code_lines.append("        return t")
+    code_lines.append("    # check builtins (e.g., exec, sorted)")
+    code_lines.append("    import builtins")
+    code_lines.append("    b = getattr(builtins, name, None)")
+    code_lines.append("    if callable(b):")
+    code_lines.append("        return b")
+    code_lines.append("    # try regex-backed components")
+    code_lines.append("    for pat, comp_name in __re_components:")
+    code_lines.append("        m = pat.match(name)")
+    code_lines.append("        if m:")
+    code_lines.append("            gd = m.groupdict()")
+    code_lines.append("            def _reg_wrapper(default=None, *args, **kwargs):")
+    code_lines.append(
+        "                d = dict(default) if isinstance(default, dict) else {}"
+    )
+    code_lines.append("                d.update(gd)")
+    code_lines.append("                return globals()[comp_name](d, *args, **kwargs)")
+    code_lines.append("            return _reg_wrapper")
+    code_lines.append("    return None")
+
     code_lines.extend(
         [
             "def __deref(name, default, args, kwargs):",
@@ -155,6 +198,13 @@ def compile_namespace(components: Dict[str, Component]) -> Dict[str, Any]:
         return repr(v)
 
     for name, comp in components.items():
+        # If the component was defined from a regex signature, expose a
+        # wrapper that matches components by name at runtime. We'll create
+        # a small dispatcher function that, when invoked as a child lookup,
+        # will match the requested child name against the regex and call
+        # the compiled component if it matches.
+        # regex-backed components are handled by __lookup_child registry;
+        # no per-component wrapper emitted here.
         body_fn = f"__body_{name}"
 
         if comp.body_type == "expr":
@@ -195,12 +245,36 @@ def compile_namespace(components: Dict[str, Component]) -> Dict[str, Any]:
                 raw = comp.body
                 if (raw.startswith("'") or raw.startswith('"')) and "$" in raw:
                     inner = _ast.literal_eval(raw)
-                    expr = _replace_default_token(inner)
+                    # If the inner string looks like an assignment of the form
+                    # `$name = <expr>` then emit code that assigns into globals()
+                    # using the evaluated name as key, rather than producing an
+                    # invalid assignment expression inside a return.
+                    m_assign = None
+                    if isinstance(inner, str):
+                        m_assign = re.match(r"^\s*\$([A-Za-z_]\w*)\s*=\s*(.+)$", inner)
+                    if m_assign:
+                        lhs_name = m_assign.group(1)
+                        rhs_raw = m_assign.group(2)
+                        rhs_expr = _replace_default_token(rhs_raw)
+                        var_expr = f"__deref('{lhs_name}', default, args, kwargs)"
+                        code_lines.append(
+                            f"def {body_fn}(default=None, *args, **kwargs):"
+                        )
+                        code_lines.append(f"    globals()[{var_expr}] = ({rhs_expr})")
+                        code_lines.append("    return default")
+                        code_lines.append("")
+                    else:
+                        expr = _replace_default_token(inner)
+                        code_lines.append(
+                            f"def {body_fn}(default=None, *args, **kwargs):"
+                        )
+                        code_lines.append(f"    return ({expr})")
+                        code_lines.append("")
                 else:
                     expr = _replace_default_token(comp.body)
-                code_lines.append(f"def {body_fn}(default=None, *args, **kwargs):")
-                code_lines.append(f"    return ({expr})")
-                code_lines.append("")
+                    code_lines.append(f"def {body_fn}(default=None, *args, **kwargs):")
+                    code_lines.append(f"    return ({expr})")
+                    code_lines.append("")
         else:
             body = _replace_default_token(textwrap.dedent(comp.body))
             if re.search(r"^\s*def\s+__body\s*\(", body, flags=re.MULTILINE):
@@ -255,8 +329,14 @@ def compile_namespace(components: Dict[str, Component]) -> Dict[str, Any]:
         code_lines.append(f"def __comp_{name}(default=None, *args, **kwargs):")
         code_lines.append(f"    result = {body_fn}(default, *args, **kwargs)")
         for child in comp.children:
+            # Resolve child names via __lookup_child which handles compiled
+            # components, top-level callables, and regex-backed components.
+            code_lines.append(f"    _child_callable = __lookup_child({repr(child)})")
+            code_lines.append(f"    if _child_callable is None:")
+            code_lines.append(f"        _child_callable = globals().get({repr(child)})")
+            code_lines.append(f"    if _child_callable is None:")
             code_lines.append(
-                f"    _child_callable = globals().get('__comp_{child}', {child})"
+                f"        raise KeyError({repr('child ' + child + ' not found')})"
             )
             code_lines.append(f"    result = __invoke_child(_child_callable, result)")
         code_lines.append("    return result")

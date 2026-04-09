@@ -1,5 +1,5 @@
 from dataclasses import dataclass
-from typing import List, Dict
+from typing import List, Dict, Optional
 import re
 import yaml
 
@@ -10,6 +10,7 @@ class Component:
     children: List[str]
     body: str
     body_type: str  # 'expr' or 'block'
+    pattern: Optional[str] = None
 
 
 def parse_components(yaml_text: str) -> Dict[str, Component]:
@@ -25,21 +26,46 @@ def parse_components(yaml_text: str) -> Dict[str, Component]:
     for key, value in loaded.items():
         if not isinstance(key, str):
             raise ValueError("component name must be a string")
-        m = re.match(
-            r"^(?P<name>[A-Za-z_]\w*)(?:\((?P<children>[^)]+)\))?$", key.strip()
-        )
-        if not m:
-            raise ValueError(f"Invalid component signature: {key!r}")
-        name = m.group("name")
-        children_raw = m.group("children")
-        children = (
-            [c.strip() for c in children_raw.split("|") if c.strip()]
-            if children_raw
-            else []
-        )
-        body_text = repr(value)
-        body_type = "block" if "\n" in body_text else "expr"
-        comps[name] = Component(
-            name=name, children=children, body=body_text, body_type=body_type
-        )
+        ks = key.strip()
+        # regex-style signature: /pattern/ optionally followed by (children)
+        if ks.startswith("/"):
+            last = ks.rfind("/")
+            if last <= 0:
+                raise ValueError(f"Invalid regex component signature: {key!r}")
+            pattern = ks[1:last]
+            remainder = ks[last + 1 :]
+            cm = re.match(r"^\((?P<children>[^)]+)\)$", remainder)
+            children_raw = cm.group("children") if cm else None
+            children = (
+                [c.strip() for c in children_raw.split("|") if c.strip()]
+                if children_raw
+                else []
+            )
+            # generate a safe name for this regex component
+            name = f"__re_{len(comps)}"
+            body_text = repr(value)
+            body_type = "block" if "\n" in body_text else "expr"
+            comps[name] = Component(
+                name=name,
+                children=children,
+                body=body_text,
+                body_type=body_type,
+                pattern=pattern,
+            )
+        else:
+            m = re.match(r"^(?P<name>[A-Za-z_]\w*)(?:\((?P<children>[^)]+)\))?$", ks)
+            if not m:
+                raise ValueError(f"Invalid component signature: {key!r}")
+            name = m.group("name")
+            children_raw = m.group("children")
+            children = (
+                [c.strip() for c in children_raw.split("|") if c.strip()]
+                if children_raw
+                else []
+            )
+            body_text = repr(value)
+            body_type = "block" if "\n" in body_text else "expr"
+            comps[name] = Component(
+                name=name, children=children, body=body_text, body_type=body_type
+            )
     return comps
