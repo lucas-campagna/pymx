@@ -1,0 +1,9 @@
+main:
+  - 3
+  - 7
+
+sum_with_op(exec): '$0 + $1'
+
+op_calc(exec): '$default[0] $default[1]' 
+
+result: 10

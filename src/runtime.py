@@ -39,17 +39,24 @@ def compile_namespace(components: Dict[str, Component]) -> Dict[str, Any]:
             "        # fall back to returning the original value.",
             "        if isinstance(value, str):",
             "            before = set(globals().keys())",
-            "            exec(value, globals())",
+            "            try:",
+            "                exec(value, globals())",
+            "            except Exception:",
+            "                pass",
+            "            # If the string is an expression, eval it and return the result",
+            "            try:",
+            "                ev = eval(value, globals())",
+            "                return ev",
+            "            except Exception:",
+            "                pass",
             "            after = set(globals().keys())",
             "            created = [n for n in after - before if callable(globals().get(n))]",
             "            if len(created) == 1:",
             "                return globals()[created[0]]",
-            "            try:",
-            "                ev = eval(value, globals())",
-            "                if callable(ev):",
-            "                    return ev",
-            "            except Exception:",
-            "                pass",
+            "            # if a non-callable name was created (like a variable), return it",
+            "            created_noncall = [n for n in after - before if not callable(globals().get(n))]",
+            "            if len(created_noncall) == 1:",
+            "                return globals()[created_noncall[0]]",
             "            return value",
             "        if isinstance(value, dict) and 'code' in value:",
             "            before = set(globals().keys())",
@@ -128,8 +135,13 @@ def compile_namespace(components: Dict[str, Component]) -> Dict[str, Any]:
     code_lines.append("__re_components = []")
     for cname, cobj in components.items():
         if getattr(cobj, "pattern", None):
+            # repr(cobj.pattern) already yields a correctly-escaped Python
+            # string literal (e.g. "'^(?P<name>\\w+)=$'"). Use that
+            # directly with re.compile() rather than adding an `r` prefix
+            # which would double-escape backslashes and break patterns
+            # like "\w".
             code_lines.append(
-                f"__re_components.append((re.compile(r{repr(cobj.pattern)}), '__comp_{cname}'))"
+                f"__re_components.append((re.compile({repr(cobj.pattern)}), '__comp_{cname}'))"
             )
 
     # Lookup helper: resolves a child name to a callable. It first prefers a
@@ -159,10 +171,28 @@ def compile_namespace(components: Dict[str, Component]) -> Dict[str, Any]:
     code_lines.append("            gd = m.groupdict()")
     code_lines.append("            def _reg_wrapper(default=None, *args, **kwargs):")
     code_lines.append(
-        "                d = dict(default) if isinstance(default, dict) else {}"
+        "                # If the incoming pipeline value is a dict, merge the captured"
     )
-    code_lines.append("                d.update(gd)")
-    code_lines.append("                return globals()[comp_name](d, *args, **kwargs)")
+    code_lines.append(
+        "                # groups into that dict so components can deref them from default."
+    )
+    code_lines.append(
+        "                # Otherwise, keep the pipeline value as the default and pass"
+    )
+    code_lines.append(
+        "                # captured groups via kwargs so __deref can find them there."
+    )
+    code_lines.append("                if isinstance(default, dict):")
+    code_lines.append("                    d = dict(default)")
+    code_lines.append("                    d.update(gd)")
+    code_lines.append(
+        "                    return globals()[comp_name](d, *args, **kwargs)"
+    )
+    code_lines.append("                kw = dict(kwargs)")
+    code_lines.append("                kw.update(gd)")
+    code_lines.append(
+        "                return globals()[comp_name](default, *args, **kw)"
+    )
     code_lines.append("            return _reg_wrapper")
     code_lines.append("    return None")
 
@@ -252,6 +282,9 @@ def compile_namespace(components: Dict[str, Component]) -> Dict[str, Any]:
                     m_assign = None
                     if isinstance(inner, str):
                         m_assign = re.match(r"^\s*\$([A-Za-z_]\w*)\s*=\s*(.+)$", inner)
+                        m_assign_literal = re.match(
+                            r"^\s*([A-Za-z_]\w*)\s*=\s*(.+)$", inner
+                        )
                     if m_assign:
                         lhs_name = m_assign.group(1)
                         rhs_raw = m_assign.group(2)
@@ -263,13 +296,270 @@ def compile_namespace(components: Dict[str, Component]) -> Dict[str, Any]:
                         code_lines.append(f"    globals()[{var_expr}] = ({rhs_expr})")
                         code_lines.append("    return default")
                         code_lines.append("")
-                    else:
-                        expr = _replace_default_token(inner)
+                    elif m_assign_literal:
+                        # LHS is a literal name; build a template for the RHS,
+                        # exec the assignment, and return the assigned global.
+                        lhs_name = m_assign_literal.group(1)
+                        rhs_raw = m_assign_literal.group(2)
                         code_lines.append(
                             f"def {body_fn}(default=None, *args, **kwargs):"
                         )
-                        code_lines.append(f"    return ({expr})")
+                        code_lines.append("    import re as _re")
+                        code_lines.append(f"    tpl = {repr(rhs_raw)}")
+                        code_lines.append(
+                            "    tpl = tpl.replace('{','{{').replace('}','}}')"
+                        )
+                        code_lines.append(
+                            "    tpl = tpl.replace('&&', ' and ').replace('||', ' or ')"
+                        )
+                        code_lines.append("    tpl2_chars = []")
+                        code_lines.append("    keys = []")
+                        code_lines.append("    i = 0")
+                        code_lines.append("    L = len(tpl)")
+                        code_lines.append("    while i < L:")
+                        code_lines.append("        ch = tpl[i]")
+                        code_lines.append("        if ch == '\\\\' and i + 1 < L:")
+                        code_lines.append("            tpl2_chars.append(tpl[i+1])")
+                        code_lines.append("            i += 2")
+                        code_lines.append("            continue")
+                        code_lines.append("        if ch == '$':")
+                        code_lines.append("            j = i + 1")
+                        code_lines.append("            if j < L:")
+                        code_lines.append(
+                            "                # named placeholder starting with letter or underscore"
+                        )
+                        code_lines.append(
+                            "                if tpl[j].isalpha() or tpl[j] == '_':"
+                        )
+                        code_lines.append("                    k = j")
+                        code_lines.append(
+                            "                    while k < L and (tpl[k].isalnum() or tpl[k] == '_'):"
+                        )
+                        code_lines.append("                        k += 1")
+                        code_lines.append("                    name = tpl[j:k]")
+                        code_lines.append(
+                            "                    tpl2_chars.append('{' + name + '}')"
+                        )
+                        code_lines.append("                    if name not in keys:")
+                        code_lines.append("                        keys.append(name)")
+                        code_lines.append("                    i = k")
+                        code_lines.append("                    continue")
+                        code_lines.append(
+                            "                # numeric placeholder like $0, $1, etc."
+                        )
+                        code_lines.append("                if tpl[j].isdigit():")
+                        code_lines.append("                    k = j")
+                        code_lines.append(
+                            "                    while k < L and tpl[k].isdigit():"
+                        )
+                        code_lines.append("                        k += 1")
+                        code_lines.append("                    name = tpl[j:k]")
+                        code_lines.append(
+                            "                    tpl2_chars.append('{' + name + '}')"
+                        )
+                        code_lines.append("                    if name not in keys:")
+                        code_lines.append("                        keys.append(name)")
+                        code_lines.append("                    i = k")
+                        code_lines.append("                    continue")
+                        code_lines.append("            tpl2_chars.append('$')")
+                        code_lines.append("            i += 1")
+                        code_lines.append("            continue")
+                        code_lines.append("        tpl2_chars.append(ch)")
+                        code_lines.append("        i += 1")
+                        code_lines.append("    tpl2 = ''.join(tpl2_chars)")
+                        code_lines.append("    mapping = {}")
+                        code_lines.append("    for _k in keys:")
+                        code_lines.append("        if _k == 'default':")
+                        code_lines.append("            v = default")
+                        code_lines.append("            mk = _k")
+                        code_lines.append(
+                            "        elif _k.startswith('n') and _k[1:].isdigit():"
+                        )
+                        code_lines.append(
+                            "            v = __deref_index(_k[1:], default, args, kwargs)"
+                        )
+                        code_lines.append("            mk = _k")
+                        code_lines.append("        elif _k.isdigit():")
+                        code_lines.append(
+                            "            v = __deref_index(_k, default, args, kwargs)"
+                        )
+                        code_lines.append("            mk = _k")
+                        code_lines.append("        else:")
+                        code_lines.append(
+                            "            v = __deref(_k, default, args, kwargs)"
+                        )
+                        code_lines.append("            mk = _k")
+                        code_lines.append("        if isinstance(v, int):")
+                        code_lines.append("            mapping[mk] = str(v)")
+                        code_lines.append(
+                            r"        elif isinstance(v, str) and _re.match(r'^[+\-*/]$', v):"
+                        )
+                        code_lines.append("            mapping[mk] = v")
+                        code_lines.append(
+                            r"        elif isinstance(v, str) and _re.match(r'^-?\d+$', v):"
+                        )
+                        code_lines.append("            mapping[mk] = v")
+                        code_lines.append("        else:")
+                        code_lines.append("            mapping[mk] = repr(v)")
+                        code_lines.append(
+                            f"    code = {repr(lhs_name + ' = ')} + tpl2.format_map(mapping)"
+                        )
+                        code_lines.append("    try:")
+                        code_lines.append("        exec(code, globals())")
+                        code_lines.append("    except Exception:")
+                        code_lines.append("        pass")
+                        code_lines.append(f"    return globals().get({repr(lhs_name)})")
                         code_lines.append("")
+                    else:
+                        # For quoted string bodies that contain $-placeholders
+                        # but are not the simple `$name = <expr>` form, build
+                        # a runtime template substitution. We map placeholders
+                        # to safe tokens (operators, numeric literals) or
+                        # repr()-escaped Python literals, then exec the
+                        # resulting source in globals(). This keeps the
+                        # substitution simple while avoiding arbitrary token
+                        # injection for non-whitelisted placeholder values.
+                        code_lines.append(
+                            f"def {body_fn}(default=None, *args, **kwargs):"
+                        )
+                        code_lines.append("    import re as _re")
+                        code_lines.append(f"    tpl = {repr(inner)}")
+                        code_lines.append(
+                            "    # escape any braces so format_map() works"
+                        )
+                        code_lines.append(
+                            "    tpl = tpl.replace('{','{{').replace('}','}}')"
+                        )
+                        code_lines.append(
+                            "    tpl = tpl.replace('&&', ' and ').replace('||', ' or ')"
+                        )
+                        code_lines.append(
+                            "    # simple parser to replace $name with {name} and collect keys"
+                        )
+                        code_lines.append("    tpl2_chars = []")
+                        code_lines.append("    keys = []")
+                        code_lines.append("    i = 0")
+                        code_lines.append("    L = len(tpl)")
+                        code_lines.append("    while i < L:")
+                        code_lines.append("        ch = tpl[i]")
+                        code_lines.append(
+                            "        # handle escaped characters (\\\\x -> x)"
+                        )
+                        code_lines.append("        if ch == '\\\\' and i + 1 < L:")
+                        code_lines.append("            tpl2_chars.append(tpl[i+1])")
+                        code_lines.append("            i += 2")
+                        code_lines.append("            continue")
+                        code_lines.append("        if ch == '$':")
+                        code_lines.append("            j = i + 1")
+                        code_lines.append(
+                            "            if j < L and (tpl[j].isalpha() or tpl[j] == '_'):"
+                        )
+                        code_lines.append("                k = j")
+                        code_lines.append(
+                            "                while k < L and (tpl[k].isalnum() or tpl[k] == '_'):"
+                        )
+                        code_lines.append("                    k += 1")
+                        code_lines.append("                name = tpl[j:k]")
+                        code_lines.append(
+                            "                tpl2_chars.append('{' + name + '}')"
+                        )
+                        code_lines.append("                if name not in keys:")
+                        code_lines.append("                    keys.append(name)")
+                        code_lines.append("                i = k")
+                        code_lines.append("                continue")
+                        code_lines.append(
+                            "            # numeric placeholder like $0, $1, etc."
+                        )
+                        code_lines.append("            if j < L and tpl[j].isdigit():")
+                        code_lines.append("                k = j")
+                        code_lines.append(
+                            "                while k < L and tpl[k].isdigit():"
+                        )
+                        code_lines.append("                    k += 1")
+                        code_lines.append("                name = tpl[j:k]")
+                        code_lines.append(
+                            "                tpl2_chars.append('{' + 'n' + name + '}')"
+                        )
+                        code_lines.append("                if 'n' + name not in keys:")
+                        code_lines.append("                    keys.append('n' + name)")
+                        code_lines.append("                i = k")
+                        code_lines.append("                continue")
+                        code_lines.append("            else:")
+                        code_lines.append("                tpl2_chars.append('$')")
+                        code_lines.append("                i += 1")
+                        code_lines.append("                continue")
+                        code_lines.append("        tpl2_chars.append(ch)")
+                        code_lines.append("        i += 1")
+                        code_lines.append("    tpl2 = ''.join(tpl2_chars)")
+                        code_lines.append(
+                            "    # numeric placeholders were encoded as {n0},{n1} etc.\n"
+                            "    # ensure tpl2 uses the n-prefixed names for any numeric fields"
+                        )
+                        code_lines.append("    mapping = {}")
+                        code_lines.append("    for _k in keys:")
+                        code_lines.append("        if _k == 'default':")
+                        code_lines.append("            v = default")
+                        code_lines.append("            mk = _k")
+                        code_lines.append(
+                            "        elif _k.startswith('n') and _k[1:].isdigit():"
+                        )
+                        code_lines.append(
+                            "            v = __deref_index(_k[1:], default, args, kwargs)"
+                        )
+                        code_lines.append("            mk = _k")
+                        code_lines.append("        elif _k.isdigit():")
+                        code_lines.append(
+                            "            v = __deref_index(_k, default, args, kwargs)"
+                        )
+                        code_lines.append("            mk = _k")
+                        code_lines.append("        else:")
+                        code_lines.append(
+                            "            v = __deref(_k, default, args, kwargs)"
+                        )
+                        code_lines.append("            mk = _k")
+                        # ints -> raw numeric token
+                        code_lines.append("        if isinstance(v, int):")
+                        code_lines.append("            mapping[mk] = str(v)")
+                        # operator strings -> raw token (whitelisted)
+                        code_lines.append(
+                            r"        elif isinstance(v, str) and _re.match(r'^[+\-*/]$', v):"
+                        )
+                        code_lines.append("            mapping[mk] = v")
+                        # numeric strings -> raw numeric token
+                        code_lines.append(
+                            r"        elif isinstance(v, str) and _re.match(r'^-?\d+$', v):"
+                        )
+                        code_lines.append("            mapping[mk] = v")
+                        # otherwise inject Python literal
+                        code_lines.append("        else:")
+                        code_lines.append("            mapping[mk] = repr(v)")
+                        code_lines.append("    code = tpl2.format_map(mapping)")
+                        code_lines.append(
+                            "    # If the template produced an expression, try to eval and return it"
+                        )
+                        code_lines.append("    try:")
+                        code_lines.append("        ev = eval(code, globals())")
+                        code_lines.append("        return ev")
+                        code_lines.append("    except Exception:")
+                        code_lines.append("        pass")
+                        code_lines.append("    before = set(globals().keys())")
+                        code_lines.append("    try:")
+                        code_lines.append("        exec(code, globals())")
+                        code_lines.append("    except Exception:")
+                        code_lines.append("        pass")
+                        code_lines.append("    after = set(globals().keys())")
+                        code_lines.append(
+                            "    created = [n for n in after - before if callable(globals().get(n))]"
+                        )
+                        code_lines.append("    if len(created) == 1:")
+                        code_lines.append("        return globals()[created[0]]")
+                        code_lines.append(
+                            "    created_noncall = [n for n in after - before if not callable(globals().get(n))]"
+                        )
+                        code_lines.append("    if len(created_noncall) == 1:")
+                        code_lines.append(
+                            "        return globals()[created_noncall[0]]"
+                        )
                 else:
                     expr = _replace_default_token(comp.body)
                     code_lines.append(f"def {body_fn}(default=None, *args, **kwargs):")
