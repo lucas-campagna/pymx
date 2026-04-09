@@ -1,5 +1,4 @@
-main(comp_inc):
-  - 10
+main(comp_inc): 10
 
 comp_inc(exec): '$default + 1'
 
