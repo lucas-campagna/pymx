@@ -43,8 +43,12 @@ def parse_components(yaml_text: str) -> Dict[str, Component]:
             )
             # generate a safe name for this regex component
             name = f"__re_{len(comps)}"
+            # Use the actual YAML-parsed string to detect multi-line bodies.
+            # repr(value) escapes newlines ("\\n"), so checking the repr
+            # will not reliably detect multi-line scalars. Check the raw
+            # value for actual newline characters instead.
             body_text = repr(value)
-            body_type = "block" if "\n" in body_text else "expr"
+            body_type = "block" if isinstance(value, str) and "\n" in value else "expr"
             comps[name] = Component(
                 name=name,
                 children=children,
