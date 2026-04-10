@@ -2,6 +2,7 @@ from dataclasses import dataclass
 from typing import List, Dict, Optional
 import re
 import yaml
+import textwrap
 
 
 @dataclass
@@ -16,6 +17,12 @@ class Component:
     orig_start: Optional[int] = None
     orig_body: Optional[str] = None
     orig_key: Optional[str] = None
+    # Template/inheritance support
+    template_level: int = 0
+    # base_name is the raw component name this component is associated with
+    # For templates this is the base signature (without leading $), for normal
+    # components it's the component name itself.
+    base_name: Optional[str] = None
 
 
 def parse_components(
@@ -54,13 +61,18 @@ def parse_components(
         if not isinstance(key, str):
             raise ValueError("component name must be a string")
         ks = key.strip()
+        # detect leading $ characters (templates)
+        tpl_level = 0
+        while tpl_level < len(ks) and ks[tpl_level] == "$":
+            tpl_level += 1
+        base_sig = ks[tpl_level:]
         # regex-style signature: /pattern/ optionally followed by (children)
-        if ks.startswith("/"):
-            last = ks.rfind("/")
+        if base_sig.startswith("/"):
+            last = base_sig.rfind("/")
             if last <= 0:
                 raise ValueError(f"Invalid regex component signature: {key!r}")
-            pattern = ks[1:last]
-            remainder = ks[last + 1 :]
+            pattern = base_sig[1:last]
+            remainder = base_sig[last + 1 :]
             cm = re.match(r"^\((?P<children>[^)]+)\)$", remainder)
             children_raw = cm.group("children") if cm else None
             children = (
@@ -88,9 +100,13 @@ def parse_components(
                 pattern=pattern,
                 source=source,
                 orig_key=ks,
+                template_level=tpl_level,
+                base_name=(None if tpl_level == 0 else base_sig[1:last]),
             )
         else:
-            m = re.match(r"^(?P<name>[A-Za-z_]\w*)(?:\((?P<children>[^)]+)\))?$", ks)
+            m = re.match(
+                r"^(?P<name>[A-Za-z_]\w*)(?:\((?P<children>[^)]+)\))?$", base_sig
+            )
             if not m:
                 raise ValueError(f"Invalid component signature: {key!r}")
             name = m.group("name")
@@ -106,13 +122,21 @@ def parse_components(
             else:
                 body_text = repr(value)
                 body_type = "expr"
-            comps[name] = Component(
-                name=name,
+            # If this key was a template (leading $), allocate a unique
+            # internal name so it doesn't collide with normal components.
+            if tpl_level > 0:
+                cname = f"__tpl_{len(comps)}"
+            else:
+                cname = name
+            comps[cname] = Component(
+                name=cname,
                 children=children,
                 body=body_text,
                 body_type=body_type,
                 source=source,
                 orig_key=ks,
+                template_level=tpl_level,
+                base_name=name,
             )
     # Attempt to locate original key lines and extract the original
     # textual body for each component so runtime can report helpful

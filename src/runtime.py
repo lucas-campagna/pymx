@@ -477,6 +477,42 @@ def compile_namespace(components: Dict[str, Component]) -> Dict[str, Any]:
             return "[" + ", ".join(parts) + "]"
         return repr(v)
 
+    # Build template mappings: map base component name -> template component
+    # Enforce compile-time rule: a component can only have one template/parent
+    templates_by_base: Dict[str, List[str]] = {}
+    # First, collect templates and normal components
+    for cname, cobj in components.items():
+        lvl = getattr(cobj, "template_level", 0)
+        if lvl and lvl > 0:
+            # template component; determine its base target(s)
+            if getattr(cobj, "pattern", None):
+                # regex template: will be applied to matching component names
+                # recorded as special entry keyed by the template cname
+                templates_by_base.setdefault("__regex_templates", []).append(cname)
+            else:
+                base = getattr(cobj, "base_name", None)
+                if base is None:
+                    continue
+                templates_by_base.setdefault(base, []).append(cname)
+
+    # For regex templates, resolve which concrete components they apply to
+    regex_templates = templates_by_base.pop("__regex_templates", [])
+    if regex_templates:
+        for rt in regex_templates:
+            pat = components[rt].pattern
+            for target_name, target_comp in list(components.items()):
+                # skip templates themselves
+                if getattr(target_comp, "template_level", 0) > 0:
+                    continue
+                # pattern is matched against the raw component name (base)
+                if re.match(pat, target_comp.name):
+                    templates_by_base.setdefault(target_comp.name, []).append(rt)
+
+    # Enforce compile-time constraints: at most one template per component
+    for base, tpl_list in templates_by_base.items():
+        if len(tpl_list) > 1:
+            raise ValueError(f"Component {base!r} has multiple templates: {tpl_list}")
+
     for name, comp in components.items():
         # Record the start line in the generated code for this component
         start_line = len(code_lines) + 1
@@ -899,6 +935,24 @@ def compile_namespace(components: Dict[str, Component]) -> Dict[str, Any]:
 
         code_lines.append(f"def __comp_{name}(default=None, *args, **kwargs):")
         code_lines.append(f"    result = {body_fn}(default, *args, **kwargs)")
+
+        # If this component has a parent template defined, invoke it once
+        tpl = None
+        if name in templates_by_base:
+            tpl = templates_by_base[name][0]
+            # call the template once and replace the current result
+            code_lines.append(
+                f"    # apply parent template {tpl} once for component {name}"
+            )
+            code_lines.append(f"    _tpl_callable = __lookup_child({repr(tpl)})")
+            code_lines.append(f"    if _tpl_callable is None:")
+            code_lines.append(f"        _tpl_callable = globals().get({repr(tpl)})")
+            code_lines.append(f"    if _tpl_callable is None:")
+            code_lines.append(
+                f"        raise KeyError({repr('parent template ' + tpl + ' not found')})"
+            )
+            code_lines.append(f"    result = __invoke_child(_tpl_callable, result)")
+
         for child in comp.children:
             # Resolve child names via __lookup_child which handles compiled
             # components, top-level callables, and regex-backed components.
