@@ -937,7 +937,31 @@ def compile_namespace(components: Dict[str, Component]) -> Dict[str, Any]:
         code_lines.append(f"    result = {body_fn}(default, *args, **kwargs)")
 
         # If this component has a parent template defined, invoke it once
+        # After the base body returns but before children are invoked. If the
+        # component was marked with pre_template_first the first child will be
+        # called before the parent template is applied.
         tpl = None
+        pre_first = getattr(comp, "pre_template_first", False)
+        first_child_name = comp.children[0] if comp.children else None
+
+        if pre_first and first_child_name is not None:
+            # call the first child before applying the parent template
+            code_lines.append(
+                f"    # pre-template: invoke first child {first_child_name} before parent for {name}"
+            )
+            code_lines.append(
+                f"    _pre_child = __lookup_child({repr(first_child_name)})"
+            )
+            code_lines.append(f"    if _pre_child is None:")
+            code_lines.append(
+                f"        _pre_child = globals().get({repr(first_child_name)})"
+            )
+            code_lines.append(f"    if _pre_child is None:")
+            code_lines.append(
+                f"        raise KeyError({repr('child ' + first_child_name + ' not found')})"
+            )
+            code_lines.append(f"    result = __invoke_child(_pre_child, result)")
+
         if name in templates_by_base:
             tpl = templates_by_base[name][0]
             # call the template once and replace the current result
@@ -953,7 +977,12 @@ def compile_namespace(components: Dict[str, Component]) -> Dict[str, Any]:
             )
             code_lines.append(f"    result = __invoke_child(_tpl_callable, result)")
 
-        for child in comp.children:
+        for i, child in enumerate(comp.children):
+            # If we already invoked the first child before applying the
+            # parent template due to the '!' operator, skip it here so it's
+            # not called twice.
+            if pre_first and i == 0:
+                continue
             # Resolve child names via __lookup_child which handles compiled
             # components, top-level callables, and regex-backed components.
             code_lines.append(f"    _child_callable = __lookup_child({repr(child)})")

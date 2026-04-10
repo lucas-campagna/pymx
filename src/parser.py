@@ -23,6 +23,8 @@ class Component:
     # For templates this is the base signature (without leading $), for normal
     # components it's the component name itself.
     base_name: Optional[str] = None
+    # Whether the first child is marked with '!' to run before parent template
+    pre_template_first: bool = False
 
 
 def parse_components(
@@ -75,11 +77,25 @@ def parse_components(
             remainder = base_sig[last + 1 :]
             cm = re.match(r"^\((?P<children>[^)]+)\)$", remainder)
             children_raw = cm.group("children") if cm else None
-            children = (
+            parts = (
                 [c.strip() for c in children_raw.split("|") if c.strip()]
                 if children_raw
                 else []
             )
+            children = []
+            pre_first = False
+            for i, p in enumerate(parts):
+                if p.endswith("!"):
+                    if i == 0:
+                        pre_first = True
+                        p = p[:-1].strip()
+                        if not p:
+                            raise ValueError(
+                                f"invalid child name with '!': {parts[0]!r}"
+                            )
+                    else:
+                        raise ValueError("only the first child may be marked with '!'")
+                children.append(p)
             # generate a safe name for this regex component
             name = f"__re_{len(comps)}"
             # Preserve multi-line YAML scalars as raw block bodies so the
@@ -102,6 +118,7 @@ def parse_components(
                 orig_key=ks,
                 template_level=tpl_level,
                 base_name=(None if tpl_level == 0 else base_sig[1:last]),
+                pre_template_first=pre_first,
             )
         else:
             m = re.match(
@@ -111,11 +128,25 @@ def parse_components(
                 raise ValueError(f"Invalid component signature: {key!r}")
             name = m.group("name")
             children_raw = m.group("children")
-            children = (
+            parts = (
                 [c.strip() for c in children_raw.split("|") if c.strip()]
                 if children_raw
                 else []
             )
+            children = []
+            pre_first = False
+            for i, p in enumerate(parts):
+                if p.endswith("!"):
+                    if i == 0:
+                        pre_first = True
+                        p = p[:-1].strip()
+                        if not p:
+                            raise ValueError(
+                                f"invalid child name with '!': {parts[0]!r}"
+                            )
+                    else:
+                        raise ValueError("only the first child may be marked with '!'")
+                children.append(p)
             if isinstance(value, str) and "\n" in value:
                 body_text = value
                 body_type = "block"
@@ -137,6 +168,7 @@ def parse_components(
                 orig_key=ks,
                 template_level=tpl_level,
                 base_name=name,
+                pre_template_first=pre_first,
             )
     # Attempt to locate original key lines and extract the original
     # textual body for each component so runtime can report helpful
