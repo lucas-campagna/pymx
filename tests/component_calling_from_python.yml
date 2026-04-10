@@ -1,5 +1,5 @@
 comp_a: $abc + $def + 3
 
-main(exec): comp_a(abc=1, def=2)
+main(py): comp_a(abc=1, def=2)
 
 result: 6 # = 1 + 2 + 3

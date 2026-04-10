@@ -1,4 +1,4 @@
-import_comp(exec): |
+import_comp(py): |
   assert(type($default) == dict)
   for key, value in $default.items():
     if type(value) == list:
@@ -15,6 +15,6 @@ main(cell1|cell2): null
 cell1(import_comp):
   math: [cos, pi]
 
-cell2(eval): cos(pi)
+cell2(py): cos(pi)
 
 result: -1

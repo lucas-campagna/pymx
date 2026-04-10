@@ -3,8 +3,8 @@ main(sorted_list=|=*3):
   - 2
   - 1
 
-/^(?P<name>\w+)=$/(exec): $name = $default
-/^=(?P<op>[+\-*/])(?P<num>\d+)/(exec): sorted_list = sorted_list $op $num
+/^(?P<name>\w+)=$/(py): $name = $default
+/^=(?P<op>[+\-*/])(?P<num>\d+)/(py): sorted_list = sorted_list $op $num
 
 
 result: [3,2,1,3,2,1,3,2,1]

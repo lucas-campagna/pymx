@@ -1,6 +1,6 @@
 main(sorted):
   iterable: [["Alice", 88], ["Bob", 75], ["Charlie", 92]]
-  key(exec): "lambda x: x[1]"
+  key(py): "lambda x: x[1]"
 result:
   - [Bob, 75]
   - [Alice, 88]

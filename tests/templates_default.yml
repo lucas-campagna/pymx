@@ -1,5 +1,5 @@
 main(comp_inc): 10
 
-comp_inc(exec): '$default + 1'
+comp_inc(py): '$default + 1'
 
 result: 11

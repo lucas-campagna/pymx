@@ -2,6 +2,6 @@ main(sum_with_op):
   - 3
   - 7
 
-sum_with_op(exec): '$0 + $1'
+sum_with_op(py): '$0 + $1'
 
 result: 10

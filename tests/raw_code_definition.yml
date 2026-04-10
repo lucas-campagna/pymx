@@ -1,4 +1,4 @@
-main(exec|sum): |
+main(py|sum): |
   def sumFn(a, b):
     return a + b
 

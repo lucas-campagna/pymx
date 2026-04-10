@@ -150,41 +150,28 @@ def compile_namespace(components: Dict[str, Component]) -> Dict[str, Any]:
             "        return None",
             "",
             "def py(value):",
-            "    # Execute multi-line Python code and try to return the last expression's value.",
-            "    # Accept either a raw string or a dict with a 'code' key.",
-            "    code = None",
-            "    if isinstance(value, str):",
-            "        code = value",
-            "    elif isinstance(value, dict) and 'code' in value:",
-            "        code = value['code']",
-            "    else:",
+            "    # Simple script runner: exec all lines except the last, eval the last.",
+            "    # Accepts only a raw string value; other types are returned unchanged.",
+            "    if not isinstance(value, str):",
             "        return value",
-            "    try:",
-            "        return eval(code, globals())",
-            "    except Exception:",
-            "        pass",
-            "    try:",
-            "        exec(code, globals())",
-            "    except Exception:",
-            "        # Try a normalized AST version where DSL-style bare names in",
-            "        # dict/list literals are turned into string constants",
-            "        norm = __dsl_normalize_script(code)",
-            "        if norm is not None:",
-            "            try:",
-            "                exec(norm, globals())",
-            "            except Exception:",
-            "                pass",
-            "    # Attempt to eval the last non-blank line if present",
-            "    try:",
-            "        last_line = next((ln for ln in reversed(code.splitlines()) if ln.strip()), '')",
-            "        if last_line:",
-            "            return eval(last_line, globals())",
-            "    except Exception:",
-            "        pass",
-            "    return None",
+            "    lines = value.splitlines()",
+            "    # drop trailing blank lines so final eval is meaningful",
+            "    while lines and not lines[-1].strip():",
+            "        lines.pop()",
+            "    if not lines:",
+            "        return None",
+            "    if len(lines) == 1:",
+            "        return eval(lines[0], globals())",
+            '    head = "\\n".join(lines[:-1])',
+            "    tail = lines[-1]",
+            "    if head:",
+            "        exec(head, globals())",
+            "    return eval(tail, globals())",
             "",
             "def __invoke_child(func, value):",
-            "    if func is exec:",
+            "    # Treat calls to exec/eval as 'run a python script' and route them",
+            "    # through the py helper which handles eval/exec and returns values.",
+            "    if func is exec or func is eval:",
             "        # When a string is provided, prefer evaluating it as an expression",
             "        # (so simple expressions return their value) and otherwise try to",
             "        # execute it. If execution fails due to DSL-style bare identifiers",
@@ -297,34 +284,13 @@ def compile_namespace(components: Dict[str, Component]) -> Dict[str, Any]:
             "                    if pos:",
             "                        return target(pos)",
             "                    return target(None)",
-            "            try:",
-            "                return eval(value, globals())",
-            "            except Exception:",
-            "                pass",
+            "            # Run the provided string through the py helper which will",
+            "            # attempt eval(), exec(), and evaluate the last expression.",
             "            before = set(globals().keys())",
-            "            # Try executing the raw source first",
             "            try:",
-            "                exec(value, globals())",
-            "            except Exception:",
-            "                # Try a normalized AST version where bare names in dict/list",
-            "                # literals are converted to string constants",
-            "                norm = __dsl_normalize_script(value)",
-            "                if norm is not None:",
-            "                    try:",
-            "                        exec(norm, globals())",
-            "                    except Exception:",
-            "                        pass",
-            "            # If the string was an expression that evaluated to something,",
-            "            # it would have returned earlier. Try evaluating the last",
-            "            # non-blank line as an expression — this covers scripts that",
-            "            # execute imports/definitions and then have a final expression",
-            "            # whose value should be returned (eg. `cos(pi)`). If that",
-            "            # fails, fall back to detecting created names.",
-            "            try:",
-            "                last_line = next((ln for ln in reversed(value.splitlines()) if ln.strip()), '')",
-            "                if last_line:",
-            "                    ev = eval(last_line, globals())",
-            "                    return ev",
+            "                rv = py(value)",
+            "                if rv is not None:",
+            "                    return rv",
             "            except Exception:",
             "                pass",
             "            after = set(globals().keys())",
@@ -338,15 +304,11 @@ def compile_namespace(components: Dict[str, Component]) -> Dict[str, Any]:
             "        if isinstance(value, dict) and 'code' in value:",
             "            before = set(globals().keys())",
             "            try:",
-            "                exec(value['code'], globals())",
+            "                rv = py(value.get('code', ''))",
+            "                if rv is not None:",
+            "                    return rv",
             "            except Exception:",
-            "                # try normalizing the code snippet as a fallback",
-            "                norm = __dsl_normalize_script(value.get('code', ''))",
-            "                if norm is not None:",
-            "                    try:",
-            "                        exec(norm, globals())",
-            "                    except Exception:",
-            "                        pass",
+            "                pass",
             "            after = set(globals().keys())",
             "            created = [n for n in after - before if callable(globals().get(n))]",
             "            if len(created) == 1:",
@@ -694,7 +656,7 @@ def compile_namespace(components: Dict[str, Component]) -> Dict[str, Any]:
                             f"    code = {repr(lhs_name + ' = ')} + tpl2.format_map(mapping)"
                         )
                         code_lines.append("    try:")
-                        code_lines.append("        exec(code, globals())")
+                        code_lines.append("        rv = py(code)")
                         code_lines.append("    except Exception:")
                         code_lines.append("        pass")
                         code_lines.append(f"    return globals().get({repr(lhs_name)})")
@@ -835,13 +797,14 @@ def compile_namespace(components: Dict[str, Component]) -> Dict[str, Any]:
                             "    # If the template produced an expression, try to eval and return it"
                         )
                         code_lines.append("    try:")
-                        code_lines.append("        ev = eval(code, globals())")
-                        code_lines.append("        return ev")
+                        code_lines.append("        rv = py(code)")
+                        code_lines.append("        if rv is not None:")
+                        code_lines.append("            return rv")
                         code_lines.append("    except Exception:")
                         code_lines.append("        pass")
                         code_lines.append("    before = set(globals().keys())")
                         code_lines.append("    try:")
-                        code_lines.append("        exec(code, globals())")
+                        code_lines.append("        py(code)")
                         code_lines.append("    except Exception:")
                         code_lines.append("        pass")
                         code_lines.append("    after = set(globals().keys())")
