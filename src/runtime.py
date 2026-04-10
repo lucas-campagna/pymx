@@ -171,7 +171,7 @@ def compile_namespace(components: Dict[str, Component]) -> Dict[str, Any]:
             "def __invoke_child(func, value):",
             "    # Treat calls to exec/eval as 'run a python script' and route them",
             "    # through the py helper which handles eval/exec and returns values.",
-            "    if func is exec or func is eval:",
+            "    if func is exec or func is eval or getattr(func, '__name__', '') == 'py':",
             "        # When a string is provided, prefer evaluating it as an expression",
             "        # (so simple expressions return their value) and otherwise try to",
             "        # execute it. If execution fails due to DSL-style bare identifiers",
@@ -653,7 +653,7 @@ def compile_namespace(components: Dict[str, Component]) -> Dict[str, Any]:
                         code_lines.append("        else:")
                         code_lines.append("            mapping[mk] = repr(v)")
                         code_lines.append(
-                            f"    code = {repr(lhs_name + ' = ')} + tpl2.format_map(mapping)"
+                            f"    code = {repr(lhs_name + ' = ')} + tpl2.format_map(mapping) + '\\n' + {repr(lhs_name)}"
                         )
                         code_lines.append("    try:")
                         code_lines.append("        rv = py(code)")
@@ -793,6 +793,11 @@ def compile_namespace(components: Dict[str, Component]) -> Dict[str, Any]:
                         code_lines.append("        else:")
                         code_lines.append("            mapping[mk] = repr(v)")
                         code_lines.append("    code = tpl2.format_map(mapping)")
+                        code_lines.append(
+                            "    m = _re.match(r'^\\s*([A-Za-z_]\\w*)\\s*=', code)"
+                        )
+                        code_lines.append("    if m:")
+                        code_lines.append("        code = code + '\\n' + m.group(1)")
                         code_lines.append(
                             "    # If the template produced an expression, try to eval and return it"
                         )
