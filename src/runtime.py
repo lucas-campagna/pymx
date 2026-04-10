@@ -60,6 +60,40 @@ def compile_namespace(components: Dict[str, Component]) -> Dict[str, Any]:
             "    except Exception:",
             "        return None",
             "",
+            "def py(value):",
+            "    # Execute multi-line Python code and try to return the last expression's value.",
+            "    # Accept either a raw string or a dict with a 'code' key.",
+            "    code = None",
+            "    if isinstance(value, str):",
+            "        code = value",
+            "    elif isinstance(value, dict) and 'code' in value:",
+            "        code = value['code']",
+            "    else:",
+            "        return value",
+            "    try:",
+            "        return eval(code, globals())",
+            "    except Exception:",
+            "        pass",
+            "    try:",
+            "        exec(code, globals())",
+            "    except Exception:",
+            "        # Try a normalized AST version where DSL-style bare names in",
+            "        # dict/list literals are turned into string constants",
+            "        norm = __dsl_normalize_script(code)",
+            "        if norm is not None:",
+            "            try:",
+            "                exec(norm, globals())",
+            "            except Exception:",
+            "                pass",
+            "    # Attempt to eval the last non-blank line if present",
+            "    try:",
+            "        last_line = next((ln for ln in reversed(code.splitlines()) if ln.strip()), '')",
+            "        if last_line:",
+            "            return eval(last_line, globals())",
+            "    except Exception:",
+            "        pass",
+            "    return None",
+            "",
             "def __invoke_child(func, value):",
             "    if func is exec:",
             "        # When a string is provided, prefer evaluating it as an expression",
@@ -357,55 +391,8 @@ def compile_namespace(components: Dict[str, Component]) -> Dict[str, Any]:
         # no per-component wrapper emitted here.
         body_fn = f"__body_{name}"
 
-        # Special-case import_comp to perform imports programmatically
-        # rather than relying on executing a DSL-produced string which may
-        # contain unquoted identifiers. This keeps import semantics stable
-        # and avoids fragile template edge-cases.
-        if name == "import_comp":
-            code_lines.append(f"def {body_fn}(default=None, *args, **kwargs):")
-            code_lines.append("    if not isinstance(default, dict):")
-            code_lines.append(
-                "        raise AssertionError('import_comp requires dict')"
-            )
-            code_lines.append("    for key, val in default.items():")
-            code_lines.append("        if isinstance(val, list):")
-            code_lines.append("            for sym in val:")
-            code_lines.append("                m = __import__(key, fromlist=[sym])")
-            code_lines.append("                globals()[sym] = getattr(m, sym)")
-            code_lines.append("        elif val is None:")
-            code_lines.append("            globals()[key] = __import__(key)")
-            code_lines.append("        elif isinstance(val, str):")
-            code_lines.append("            globals()[val] = __import__(key)")
-            code_lines.append("        else:")
-            code_lines.append(
-                "            raise AssertionError('Invalid value for import')"
-            )
-            code_lines.append("    return default")
-            code_lines.append("")
-            # emit wrapper and continue to next component
-            code_lines.append(f"def __comp_{name}(default=None, *args, **kwargs):")
-            code_lines.append(f"    result = {body_fn}(default, *args, **kwargs)")
-            for child in comp.children:
-                code_lines.append(
-                    f"    _child_callable = __lookup_child({repr(child)})"
-                )
-                code_lines.append(f"    if _child_callable is None:")
-                code_lines.append(
-                    f"        _child_callable = globals().get({repr(child)})"
-                )
-                code_lines.append(f"    if _child_callable is None:")
-                code_lines.append(
-                    f"        raise KeyError({repr('child ' + child + ' not found')})"
-                )
-                code_lines.append(
-                    f"    result = __invoke_child(_child_callable, result)"
-                )
-            code_lines.append("    return result")
-            code_lines.append("")
-            code_lines.append(f"{name} = __comp_{name}")
-            code_lines.append(f"__comp_{name}.__is_dsl_component = True")
-            code_lines.append("")
-            continue
+        # No runtime baked-in components; all components must come from YAML.
+        # (Previously import_comp was hard-coded here; remove that special-case)
 
         if comp.body_type == "expr":
             raw = comp.body
