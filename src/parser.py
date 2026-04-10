@@ -43,15 +43,12 @@ def parse_components(yaml_text: str) -> Dict[str, Component]:
             )
             # generate a safe name for this regex component
             name = f"__re_{len(comps)}"
-            # If this was a multi-line YAML scalar, keep the raw string value
-            # (so callers can emit it as code). For single-line scalars we keep
-            # the repr(value) so it can be embedded as a Python literal.
-            if isinstance(value, str) and "\n" in value:
-                body_text = value
-                body_type = "block"
-            else:
-                body_text = repr(value)
-                body_type = "expr"
+            # Store the Python literal representation of the value. The
+            # compile step expects comp.body to be a Python literal (repr)
+            # so we keep repr(value) here. We mark it as a block if the
+            # representation contains an embedded newline escape ("\n").
+            body_text = repr(value)
+            body_type = "block" if "\n" in body_text else "expr"
             comps[name] = Component(
                 name=name,
                 children=children,
@@ -70,12 +67,8 @@ def parse_components(yaml_text: str) -> Dict[str, Component]:
                 if children_raw
                 else []
             )
-            if isinstance(value, str) and "\n" in value:
-                body_text = value
-                body_type = "block"
-            else:
-                body_text = repr(value)
-                body_type = "expr"
+            body_text = repr(value)
+            body_type = "block" if "\n" in body_text else "expr"
             comps[name] = Component(
                 name=name, children=children, body=body_text, body_type=body_type
             )

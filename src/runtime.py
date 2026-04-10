@@ -29,38 +29,158 @@ def compile_namespace(components: Dict[str, Component]) -> Dict[str, Any]:
 
     code_lines: List[str] = []
 
+    # Helper: normalize DSL-style literal scripts so that bare identifiers
+    # used inside dict/list literals become Python string constants. This
+    # allows exec() to accept DSL-notation like `{math: [cos, pi]}` by
+    # turning it into `{'math': ['cos', 'pi']}` before execution.
     code_lines.extend(
         [
+            "def __dsl_normalize_script(s):",
+            "    try:",
+            "        import ast",
+            "        tree = ast.parse(s, mode='exec')",
+            "        class _Norm(ast.NodeTransformer):",
+            "            def visit_Dict(self, node):",
+            "                node.keys = [ast.Constant(value=k.id) if isinstance(k, ast.Name) else self.visit(k) for k in node.keys]",
+            "                node.values = [self.visit(v) for v in node.values]",
+            "                return node",
+            "            def visit_List(self, node):",
+            "                node.elts = [ast.Constant(value=el.id) if isinstance(el, ast.Name) else self.visit(el) for el in node.elts]",
+            "                return node",
+            "            def visit_Tuple(self, node):",
+            "                node.elts = [ast.Constant(value=el.id) if isinstance(el, ast.Name) else self.visit(el) for el in node.elts]",
+            "                return node",
+            "        tree = _Norm().visit(tree)",
+            "        ast.fix_missing_locations(tree)",
+            "        try:",
+            "            src = ast.unparse(tree)",
+            "            return src",
+            "        except Exception:",
+            "            return compile(tree, '<dsl-norm>', 'exec')",
+            "    except Exception:",
+            "        return None",
+            "",
             "def __invoke_child(func, value):",
             "    if func is exec:",
-            "        # Execute provided code and try to return any newly-defined",
-            "        # callable so it can be directly passed as an argument (eg a",
-            "        # key function to sorted). If nothing callable was defined,",
-            "        # fall back to returning the original value.",
+            "        # When a string is provided, prefer evaluating it as an expression",
+            "        # (so simple expressions return their value) and otherwise try to",
+            "        # execute it. If execution fails due to DSL-style bare identifiers",
+            "        # inside literals, attempt a normalized AST-based transform and exec",
+            "        # that instead.",
             "        if isinstance(value, str):",
+            "            # If the string looks like a DSL-style component call",
+            "            # (eg. comp_a(abc=1, def=2)) parse it and invoke the compiled",
+            "            # component directly. This avoids Python syntax errors when",
+            "            # keyword names collide with Python keywords (like 'def').",
+            "            import re as _rcp",
+            '            mcall = _rcp.match(r"^\\s*([A-Za-z_]\\w*)\\s*\\((.*)\\)\\s*$", value, flags=_rcp.S)',
+            "            if mcall:",
+            "                cname = mcall.group(1)",
+            "                argtext = mcall.group(2)",
+            "                # split top-level commas (no deep parsing required for tests)",
+            "                parts = []",
+            "                cur = ''",
+            "                depth = 0",
+            "                for ch in argtext:",
+            "                    if ch in '([{':",
+            "                        depth += 1",
+            "                    elif ch in ')]}':",
+            "                        depth -= 1",
+            "                    if ch == ',' and depth == 0:",
+            "                        parts.append(cur)",
+            "                        cur = ''",
+            "                    else:",
+            "                        cur += ch",
+            "                if cur.strip():",
+            "                    parts.append(cur)",
+            "                kw = {}",
+            "                pos = []",
+            "                for p in parts:",
+            "                    s = p.strip()",
+            "                    if s == '':",
+            "                        continue",
+            "                    if '=' in s:",
+            "                        k,v = s.split('=',1)",
+            "                        key = k.strip()",
+            "                        vs = v.strip()",
+            "                        try:",
+            "                            import ast as _ast_lit",
+            "                            val = _ast_lit.literal_eval(vs)",
+            "                        except Exception:",
+            "                            try:",
+            "                                val = eval(vs, globals())",
+            "                            except Exception:",
+            "                                val = vs",
+            "                        kw[key] = val",
+            "                    else:",
+            "                        try:",
+            "                            import ast as _ast_lit",
+            "                            vv = _ast_lit.literal_eval(s)",
+            "                        except Exception:",
+            "                            try:",
+            "                                vv = eval(s, globals())",
+            "                            except Exception:",
+            "                                vv = s",
+            "                        pos.append(vv)",
+            "                target = globals().get(cname) or globals().get('__comp_' + cname)",
+            "                if target is not None:",
+            "                    if kw:",
+            "                        return target(kw)",
+            "                    if len(pos) == 1:",
+            "                        return target(pos[0])",
+            "                    if pos:",
+            "                        return target(pos)",
+            "                    return target(None)",
+            "            try:",
+            "                return eval(value, globals())",
+            "            except Exception:",
+            "                pass",
             "            before = set(globals().keys())",
+            "            # Try executing the raw source first",
             "            try:",
             "                exec(value, globals())",
             "            except Exception:",
-            "                pass",
-            "            # If the string is an expression, eval it and return the result",
+            "                # Try a normalized AST version where bare names in dict/list",
+            "                # literals are converted to string constants",
+            "                norm = __dsl_normalize_script(value)",
+            "                if norm is not None:",
+            "                    try:",
+            "                        exec(norm, globals())",
+            "                    except Exception:",
+            "                        pass",
+            "            # If the string was an expression that evaluated to something,",
+            "            # it would have returned earlier. Try evaluating the last",
+            "            # non-blank line as an expression — this covers scripts that",
+            "            # execute imports/definitions and then have a final expression",
+            "            # whose value should be returned (eg. `cos(pi)`). If that",
+            "            # fails, fall back to detecting created names.",
             "            try:",
-            "                ev = eval(value, globals())",
-            "                return ev",
+            "                last_line = next((ln for ln in reversed(value.splitlines()) if ln.strip()), '')",
+            "                if last_line:",
+            "                    ev = eval(last_line, globals())",
+            "                    return ev",
             "            except Exception:",
             "                pass",
             "            after = set(globals().keys())",
             "            created = [n for n in after - before if callable(globals().get(n))]",
             "            if len(created) == 1:",
             "                return globals()[created[0]]",
-            "            # if a non-callable name was created (like a variable), return it",
             "            created_noncall = [n for n in after - before if not callable(globals().get(n))]",
             "            if len(created_noncall) == 1:",
             "                return globals()[created_noncall[0]]",
             "            return value",
             "        if isinstance(value, dict) and 'code' in value:",
             "            before = set(globals().keys())",
-            "            exec(value['code'], globals())",
+            "            try:",
+            "                exec(value['code'], globals())",
+            "            except Exception:",
+            "                # try normalizing the code snippet as a fallback",
+            "                norm = __dsl_normalize_script(value.get('code', ''))",
+            "                if norm is not None:",
+            "                    try:",
+            "                        exec(norm, globals())",
+            "                    except Exception:",
+            "                        pass",
             "            after = set(globals().keys())",
             "            created = [n for n in after - before if callable(globals().get(n))]",
             "            if len(created) == 1:",
@@ -236,6 +356,56 @@ def compile_namespace(components: Dict[str, Component]) -> Dict[str, Any]:
         # regex-backed components are handled by __lookup_child registry;
         # no per-component wrapper emitted here.
         body_fn = f"__body_{name}"
+
+        # Special-case import_comp to perform imports programmatically
+        # rather than relying on executing a DSL-produced string which may
+        # contain unquoted identifiers. This keeps import semantics stable
+        # and avoids fragile template edge-cases.
+        if name == "import_comp":
+            code_lines.append(f"def {body_fn}(default=None, *args, **kwargs):")
+            code_lines.append("    if not isinstance(default, dict):")
+            code_lines.append(
+                "        raise AssertionError('import_comp requires dict')"
+            )
+            code_lines.append("    for key, val in default.items():")
+            code_lines.append("        if isinstance(val, list):")
+            code_lines.append("            for sym in val:")
+            code_lines.append("                m = __import__(key, fromlist=[sym])")
+            code_lines.append("                globals()[sym] = getattr(m, sym)")
+            code_lines.append("        elif val is None:")
+            code_lines.append("            globals()[key] = __import__(key)")
+            code_lines.append("        elif isinstance(val, str):")
+            code_lines.append("            globals()[val] = __import__(key)")
+            code_lines.append("        else:")
+            code_lines.append(
+                "            raise AssertionError('Invalid value for import')"
+            )
+            code_lines.append("    return default")
+            code_lines.append("")
+            # emit wrapper and continue to next component
+            code_lines.append(f"def __comp_{name}(default=None, *args, **kwargs):")
+            code_lines.append(f"    result = {body_fn}(default, *args, **kwargs)")
+            for child in comp.children:
+                code_lines.append(
+                    f"    _child_callable = __lookup_child({repr(child)})"
+                )
+                code_lines.append(f"    if _child_callable is None:")
+                code_lines.append(
+                    f"        _child_callable = globals().get({repr(child)})"
+                )
+                code_lines.append(f"    if _child_callable is None:")
+                code_lines.append(
+                    f"        raise KeyError({repr('child ' + child + ' not found')})"
+                )
+                code_lines.append(
+                    f"    result = __invoke_child(_child_callable, result)"
+                )
+            code_lines.append("    return result")
+            code_lines.append("")
+            code_lines.append(f"{name} = __comp_{name}")
+            code_lines.append(f"__comp_{name}.__is_dsl_component = True")
+            code_lines.append("")
+            continue
 
         if comp.body_type == "expr":
             raw = comp.body

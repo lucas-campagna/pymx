@@ -1,0 +1,20 @@
+import_comp(exec): |
+  assert(type($default) == dict)
+  for key, value in $default.items():
+    if type(value) == list:
+      exec(f"from {key} import {value.join(', ')}")
+    elif type(value) == None:
+      exec(f"import {key}")
+    elif type(value) == str:
+      exec(f"import {key} as {value}")
+    else:
+      raise "Invalid value for import"
+
+main(cell1|cell2): null
+
+cell1(import_comp):
+  math: [cos, pi]
+
+cell2(exec): cos(pi)
+
+result: -1
