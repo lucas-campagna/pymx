@@ -11,9 +11,16 @@ class Component:
     body: str
     body_type: str  # 'expr' or 'block'
     pattern: Optional[str] = None
+    # Optional origin information for improved error reporting
+    source: Optional[str] = None
+    orig_start: Optional[int] = None
+    orig_body: Optional[str] = None
+    orig_key: Optional[str] = None
 
 
-def parse_components(yaml_text: str) -> Dict[str, Component]:
+def parse_components(
+    yaml_text: str, source: Optional[str] = None
+) -> Dict[str, Component]:
     """Parse top-level components from YAML text.
 
     Each top-level key is a component signature `name(child|other)` or `name`.
@@ -79,6 +86,8 @@ def parse_components(yaml_text: str) -> Dict[str, Component]:
                 body=body_text,
                 body_type=body_type,
                 pattern=pattern,
+                source=source,
+                orig_key=ks,
             )
         else:
             m = re.match(r"^(?P<name>[A-Za-z_]\w*)(?:\((?P<children>[^)]+)\))?$", ks)
@@ -98,6 +107,56 @@ def parse_components(yaml_text: str) -> Dict[str, Component]:
                 body_text = repr(value)
                 body_type = "expr"
             comps[name] = Component(
-                name=name, children=children, body=body_text, body_type=body_type
+                name=name,
+                children=children,
+                body=body_text,
+                body_type=body_type,
+                source=source,
+                orig_key=ks,
             )
+    # Attempt to locate original key lines and extract the original
+    # textual body for each component so runtime can report helpful
+    # error messages with filename and line numbers.
+    try:
+        lines = yaml_text.splitlines()
+        for name, comp in comps.items():
+            if not comp.orig_key:
+                continue
+            pattern = r"^\s*" + re.escape(comp.orig_key) + r"\s*:(.*)$"
+            found = None
+            for i, ln in enumerate(lines):
+                m = re.match(pattern, ln)
+                if m:
+                    found = (i, m.group(1))
+                    break
+            if not found:
+                continue
+            idx, rest = found
+            comp.orig_start = idx + 1
+            rest = rest or ""
+            rest_s = rest.strip()
+            if rest_s.startswith("|") or rest_s.startswith(">"):
+                # collect following indented lines
+                j = idx + 1
+                body_lines = []
+                while j < len(lines):
+                    l = lines[j]
+                    if l.strip() == "":
+                        body_lines.append("")
+                        j += 1
+                        continue
+                    if not l.startswith(" "):
+                        break
+                    body_lines.append(l)
+                    j += 1
+                # dedent
+                comp.orig_body = textwrap.dedent("\n".join(body_lines)).lstrip("\n")
+            elif rest_s != "":
+                comp.orig_body = rest_s
+            else:
+                comp.orig_body = ""
+    except Exception:
+        # Best-effort only; don't fail parsing on extraction errors
+        pass
+
     return comps

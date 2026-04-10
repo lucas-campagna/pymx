@@ -28,6 +28,8 @@ def compile_namespace(components: Dict[str, Component]) -> Dict[str, Any]:
     import ast as _ast
 
     code_lines: List[str] = []
+    # Map of component name -> metadata for error reporting
+    comp_map: Dict[str, Dict[str, Any]] = {}
 
     # Local helper used at compile-time to normalize Python source produced
     # from YAML block bodies. It mirrors the runtime __dsl_normalize_script
@@ -476,6 +478,8 @@ def compile_namespace(components: Dict[str, Component]) -> Dict[str, Any]:
         return repr(v)
 
     for name, comp in components.items():
+        # Record the start line in the generated code for this component
+        start_line = len(code_lines) + 1
         # If the component was defined from a regex signature, expose a
         # wrapper that matches components by name at runtime. We'll create
         # a small dispatcher function that, when invoked as a child lookup,
@@ -911,12 +915,27 @@ def compile_namespace(components: Dict[str, Component]) -> Dict[str, Any]:
         code_lines.append(f"{name} = __comp_{name}")
         code_lines.append(f"__comp_{name}.__is_dsl_component = True")
         code_lines.append("")
+        # record the emitted range for mapping back to DSL source
+        end_line = len(code_lines)
+        comp_map[name] = {
+            "start": start_line,
+            "end": end_line,
+            "body": comp.body,
+            "body_type": comp.body_type,
+            "source": getattr(comp, "source", None),
+            "orig_start": getattr(comp, "orig_start", None),
+            "orig_body": getattr(comp, "orig_body", None),
+            "orig_key": getattr(comp, "orig_key", None),
+        }
 
     code = "\n".join(code_lines)
     ns: Dict[str, Any] = {}
     exec(compile(code, "<dsl-compiled>", "exec"), ns)
     # expose the actual generated code for debugging
     ns["_dsl_generated_code"] = code
+    # Attach component mapping for error reporting (component -> start/end in
+    # generated code lines and original YAML source where available).
+    ns["_dsl_component_map"] = comp_map
     # ensure the py helper is available as a top-level callable so YAML can
     # refer to it as a child: e.g., main(py): <code>
     if "py" in ns:
@@ -930,7 +949,22 @@ def run_component(ns: Dict[str, Any], name: str, default: Any = None):
         func = ns.get(f"__comp_{name}")
     if func is None:
         raise KeyError(f"Component {name!r} not found in the compiled namespace")
-    return func(default)
+    import sys, traceback
+
+    try:
+        return func(default)
+    except Exception:
+        exc_type, exc_value, tb = sys.exc_info()
+        # Format a user-facing DSL-aware error message and re-raise the same
+        # exception type with the augmented message, preserving traceback.
+        try:
+            extra = _format_dsl_exception(ns, exc_type, exc_value, tb)
+            new_msg = f"{exc_value}\n\n{extra}"
+            new_exc = exc_type(new_msg)
+            raise new_exc.with_traceback(tb)
+        except Exception:
+            # If formatting fails for any reason, re-raise original
+            raise
 
 
 def _deep_compare(
@@ -998,6 +1032,108 @@ def _deep_compare(
         return a == b
     except Exception:
         return False
+
+
+def _format_dsl_exception(
+    ns: Dict[str, Any], exc_type, exc_value, tb, context_lines: int = 3
+) -> str:
+    import traceback, os
+
+    # Locate the last frame generated from the DSL-compiled module
+    extracted = traceback.extract_tb(tb)
+    dsl_frame = None
+    for fr in reversed(extracted):
+        if fr.filename == "<dsl-compiled>":
+            dsl_frame = fr
+            break
+    if dsl_frame is None:
+        return "(no DSL frame in traceback)"
+
+    lineno = dsl_frame.lineno
+    comp_map = ns.get("_dsl_component_map", {})
+    # Find component containing this line
+    found = None
+    for cname, meta in comp_map.items():
+        if meta["start"] <= lineno <= meta["end"]:
+            found = (cname, meta)
+            break
+    if found is None:
+        # fallback: nearest preceding component
+        candidates = [
+            (m["start"], n, m) for n, m in comp_map.items() if m["start"] <= lineno
+        ]
+        if candidates:
+            _, cname, meta = max(candidates)
+            found = (cname, meta)
+    if found is None:
+        return f"Error at generated code line {lineno} (no component mapping available)"
+
+    cname, meta = found
+    source = meta.get("source")
+    orig_start = meta.get("orig_start")
+    orig_body = meta.get("orig_body")
+    body_type = meta.get("body_type")
+
+    lines = []
+    lines.append(
+        f"Error executing DSL component '{cname}': {exc_type.__name__}: {exc_value}"
+    )
+    if source:
+        lines.append(f"Source: {source}")
+    # Show DSL call stack (scan traceback for other DSL frames)
+    dsl_stack = []
+    for fr in extracted:
+        if fr.filename == "<dsl-compiled>":
+            # map to component name if possible
+            ln = fr.lineno
+            for n, m in comp_map.items():
+                if m["start"] <= ln <= m["end"]:
+                    dsl_stack.append((n, ln - m["start"]))
+                    break
+    if dsl_stack:
+        lines.append("")
+        lines.append("DSL call stack (outer -> inner):")
+        for n, off in dsl_stack:
+            lines.append(f"  - {n} (compiled line offset {off})")
+
+    # Show a snippet from original YAML body if available
+    if orig_body:
+        body_lines = orig_body.splitlines()
+        # Determine the offending line within the body if orig_start available
+        if orig_start is not None:
+            # attempt to map generated lineno to orig line; this is best-effort
+            # If the orig_start is known, assume the first line of the generated
+            # component body corresponds to orig_start.
+            gen_start = meta.get("start")
+            offending_generated_offset = lineno - gen_start
+            # clamp to body length
+            idx = max(0, min(len(body_lines) - 1, offending_generated_offset))
+        else:
+            idx = 0
+        start = max(0, idx - context_lines)
+        end = min(len(body_lines), idx + context_lines + 1)
+        lines.append("")
+        lines.append("DSL source (context):")
+        for i in range(start, end):
+            prefix = ">> " if i == idx else "   "
+            lines.append(f"{prefix}{i + 1 + (orig_start or 0):4d}: {body_lines[i]}")
+
+    # Optionally include the generated Python lines when DSL_DEBUG=1
+    try:
+        if os.environ.get("DSL_DEBUG") == "1":
+            gen = ns.get("_dsl_generated_code", "")
+            gen_lines = gen.splitlines()
+            gstart = max(0, lineno - context_lines - 1)
+            gend = min(len(gen_lines), lineno + context_lines)
+            lines.append("")
+            lines.append("Generated Python (context):")
+            for i in range(gstart, gend):
+                prefix = ">> " if i == lineno - 1 else "   "
+                lines.append(f"{prefix}{i + 1:4d}: {gen_lines[i]}")
+    except Exception:
+        pass
+
+    return "\n".join(lines)
 
 
 def check(yaml_code: str, start: str = "main", expects: str = "result"):
