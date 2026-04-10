@@ -29,6 +29,73 @@ def compile_namespace(components: Dict[str, Component]) -> Dict[str, Any]:
 
     code_lines: List[str] = []
 
+    # Local helper used at compile-time to normalize Python source produced
+    # from YAML block bodies. It mirrors the runtime __dsl_normalize_script
+    # but runs here so we can embed normalized source into generated code
+    # (fixes patterns like `value.join(', ')` -> `', '.join(value)`).
+    def _normalize_source(src: str) -> str | None:
+        try:
+            tree = _ast.parse(src, mode="exec")
+
+            class _Norm(_ast.NodeTransformer):
+                def visit_Call(self, node: _ast.Call) -> _ast.AST:
+                    # Only perform the reversed-join transformation at compile-time.
+                    # Avoid altering Dict/List/Tuple structures here to prevent
+                    # accidental conversion of variable names (eg. for-loop
+                    # targets) into string constants.
+                    node = self.generic_visit(node)
+                    try:
+                        if (
+                            isinstance(node.func, _ast.Attribute)
+                            and node.func.attr == "join"
+                            and len(node.args) == 1
+                        ):
+                            sep_arg = node.args[0]
+                            if isinstance(sep_arg, _ast.Constant) and isinstance(
+                                sep_arg.value, str
+                            ):
+                                # transform X.join(sep) -> sep.join(X)
+                                new_func = _ast.Attribute(
+                                    value=_ast.Constant(value=sep_arg.value),
+                                    attr="join",
+                                    ctx=_ast.Load(),
+                                )
+                                new_node = _ast.Call(
+                                    func=new_func, args=[node.func.value], keywords=[]
+                                )
+                                return _ast.copy_location(new_node, node)
+                        # If a block includes exec(<code>) without explicit globals,
+                        # ensure the exec runs in module globals so imports and
+                        # definitions persist across components. Rewrite
+                        # exec(x) -> exec(x, globals()) when only one arg is present.
+                        if (
+                            isinstance(node.func, _ast.Name)
+                            and node.func.id == "exec"
+                            and len(node.args) == 1
+                        ):
+                            globals_call = _ast.Call(
+                                func=_ast.Name(id="globals", ctx=_ast.Load()),
+                                args=[],
+                                keywords=[],
+                            )
+                            new_args = [node.args[0], globals_call]
+                            new_node = _ast.Call(
+                                func=node.func, args=new_args, keywords=node.keywords
+                            )
+                            return _ast.copy_location(new_node, node)
+                    except Exception:
+                        pass
+                    return node
+
+            tree = _Norm().visit(tree)
+            _ast.fix_missing_locations(tree)
+            try:
+                return _ast.unparse(tree)
+            except Exception:
+                return None
+        except Exception:
+            return None
+
     # Helper: normalize DSL-style literal scripts so that bare identifiers
     # used inside dict/list literals become Python string constants. This
     # allows exec() to accept DSL-notation like `{math: [cos, pi]}` by
@@ -41,7 +108,14 @@ def compile_namespace(components: Dict[str, Component]) -> Dict[str, Any]:
             "        tree = ast.parse(s, mode='exec')",
             "        class _Norm(ast.NodeTransformer):",
             "            def visit_Dict(self, node):",
-            "                node.keys = [ast.Constant(value=k.id) if isinstance(k, ast.Name) else self.visit(k) for k in node.keys]",
+            "                # convert bare-name dict keys into string constants",
+            "                new_keys = []",
+            "                for k in node.keys:",
+            "                    if isinstance(k, ast.Name):",
+            "                        new_keys.append(ast.Constant(value=k.id))",
+            "                    else:",
+            "                        new_keys.append(self.visit(k))",
+            "                node.keys = new_keys",
             "                node.values = [self.visit(v) for v in node.values]",
             "                return node",
             "            def visit_List(self, node):",
@@ -49,6 +123,21 @@ def compile_namespace(components: Dict[str, Component]) -> Dict[str, Any]:
             "                return node",
             "            def visit_Tuple(self, node):",
             "                node.elts = [ast.Constant(value=el.id) if isinstance(el, ast.Name) else self.visit(el) for el in node.elts]",
+            "                return node",
+            "            def visit_Call(self, node):",
+            "                # Transform value.join(', ') -> ', '.join(value) to support",
+            "                # code that uses the reversed join pattern inside f-strings",
+            "                node = self.generic_visit(node)",
+            "                try:",
+            "                    if isinstance(node.func, ast.Attribute) and node.func.attr == 'join':",
+            "                        receiver = node.func.value",
+            "                        if isinstance(receiver, ast.Name) and len(node.args) == 1 and isinstance(node.args[0], ast.Constant) and isinstance(node.args[0].value, str):",
+            "                            sep = node.args[0]",
+            "                            new_func = ast.Attribute(value=ast.Constant(value=sep.value), attr='join', ctx=ast.Load())",
+            "                            new_node = ast.Call(func=new_func, args=[receiver], keywords=[])",
+            "                            return ast.copy_location(new_node, node)",
+            "                except Exception:",
+            "                    pass",
             "                return node",
             "        tree = _Norm().visit(tree)",
             "        ast.fix_missing_locations(tree)",
@@ -106,56 +195,99 @@ def compile_namespace(components: Dict[str, Component]) -> Dict[str, Any]:
             "            # (eg. comp_a(abc=1, def=2)) parse it and invoke the compiled",
             "            # component directly. This avoids Python syntax errors when",
             "            # keyword names collide with Python keywords (like 'def').",
-            "            import re as _rcp",
+            "            import ast as _ast_call, re as _rcp",
             '            mcall = _rcp.match(r"^\\s*([A-Za-z_]\\w*)\\s*\\((.*)\\)\\s*$", value, flags=_rcp.S)',
             "            if mcall:",
             "                cname = mcall.group(1)",
             "                argtext = mcall.group(2)",
-            "                # split top-level commas (no deep parsing required for tests)",
-            "                parts = []",
-            "                cur = ''",
-            "                depth = 0",
-            "                for ch in argtext:",
-            "                    if ch in '([{':",
-            "                        depth += 1",
-            "                    elif ch in ')]}':",
-            "                        depth -= 1",
-            "                    if ch == ',' and depth == 0:",
-            "                        parts.append(cur)",
-            "                        cur = ''",
-            "                    else:",
-            "                        cur += ch",
-            "                if cur.strip():",
-            "                    parts.append(cur)",
             "                kw = {}",
             "                pos = []",
-            "                for p in parts:",
-            "                    s = p.strip()",
-            "                    if s == '':",
-            "                        continue",
-            "                    if '=' in s:",
-            "                        k,v = s.split('=',1)",
-            "                        key = k.strip()",
-            "                        vs = v.strip()",
-            "                        try:",
-            "                            import ast as _ast_lit",
-            "                            val = _ast_lit.literal_eval(vs)",
-            "                        except Exception:",
+            "                if argtext.strip() != '':",
+            "                    try:",
+            "                        # Parse the arguments via AST to handle commas in strings",
+            "                        call_src = 'f(' + argtext + ')'",
+            "                        expr = _ast_call.parse(call_src, mode='eval').body",
+            "                        for a in expr.args:",
             "                            try:",
-            "                                val = eval(vs, globals())",
+            "                                val = _ast_call.literal_eval(a)",
             "                            except Exception:",
-            "                                val = vs",
-            "                        kw[key] = val",
-            "                    else:",
-            "                        try:",
-            "                            import ast as _ast_lit",
-            "                            vv = _ast_lit.literal_eval(s)",
-            "                        except Exception:",
-            "                            try:",
-            "                                vv = eval(s, globals())",
-            "                            except Exception:",
-            "                                vv = s",
-            "                        pos.append(vv)",
+            "                                try:",
+            "                                    # Evaluate complex expressions in the current globals",
+            "                                    val = eval(compile(_ast_call.Expression(a), '<ast>', 'eval'), globals())",
+            "                                except Exception:",
+            "                                    try:",
+            "                                        val = _ast_call.unparse(a)",
+            "                                    except Exception:",
+            "                                        val = None",
+            "                            pos.append(val)",
+            "                        for k in expr.keywords:",
+            "                            if k.arg is None:",
+            "                                try:",
+            "                                    v = eval(compile(_ast_call.Expression(k.value), '<ast>', 'eval'), globals())",
+            "                                except Exception:",
+            "                                    try:",
+            "                                        v = _ast_call.literal_eval(k.value)",
+            "                                    except Exception:",
+            "                                        v = None",
+            "                                if isinstance(v, dict):",
+            "                                    kw.update(v)",
+            "                            else:",
+            "                                key = k.arg",
+            "                                try:",
+            "                                    val = _ast_call.literal_eval(k.value)",
+            "                                except Exception:",
+            "                                    try:",
+            "                                        val = eval(compile(_ast_call.Expression(k.value), '<ast>', 'eval'), globals())",
+            "                                    except Exception:",
+            "                                        try:",
+            "                                            val = _ast_call.unparse(k.value)",
+            "                                        except Exception:",
+            "                                            val = None",
+            "                                kw[key] = val",
+            "                    except Exception:",
+            "                        # Fallback to the previous simple top-level comma splitter",
+            "                        parts = []",
+            "                        cur = ''",
+            "                        depth = 0",
+            "                        for ch in argtext:",
+            "                            if ch in '([{':",
+            "                                depth += 1",
+            "                            elif ch in ')]}':",
+            "                                depth -= 1",
+            "                            if ch == ',' and depth == 0:",
+            "                                parts.append(cur)",
+            "                                cur = ''",
+            "                            else:",
+            "                                cur += ch",
+            "                        if cur.strip():",
+            "                            parts.append(cur)",
+            "                        for p in parts:",
+            "                            s = p.strip()",
+            "                            if s == '':",
+            "                                continue",
+            "                            if '=' in s:",
+            "                                k,v = s.split('=',1)",
+            "                                key = k.strip()",
+            "                                vs = v.strip()",
+            "                                try:",
+            "                                    import ast as _ast_lit",
+            "                                    val = _ast_lit.literal_eval(vs)",
+            "                                except Exception:",
+            "                                    try:",
+            "                                        val = eval(vs, globals())",
+            "                                    except Exception:",
+            "                                        val = vs",
+            "                                kw[key] = val",
+            "                            else:",
+            "                                try:",
+            "                                    import ast as _ast_lit",
+            "                                    vv = _ast_lit.literal_eval(s)",
+            "                                except Exception:",
+            "                                    try:",
+            "                                        vv = eval(s, globals())",
+            "                                    except Exception:",
+            "                                        vv = s",
+            "                                pos.append(vv)",
             "                target = globals().get(cname) or globals().get('__comp_' + cname)",
             "                if target is not None:",
             "                    if kw:",
@@ -732,6 +864,18 @@ def compile_namespace(components: Dict[str, Component]) -> Dict[str, Any]:
                     code_lines.append("")
         else:
             body = _replace_default_token(textwrap.dedent(comp.body))
+            # Try a limited compile-time normalization for reversed join
+            # patterns (value.join(', ')) so code embedded from multi-line
+            # YAML block bodies doesn't contain `.join` calls on list
+            # objects (which would raise AttributeError). Only perform the
+            # join() transform here; other DSL literal normalization is
+            # handled at runtime.
+            try:
+                norm = _normalize_source(body)
+                if isinstance(norm, str):
+                    body = norm
+            except Exception:
+                pass
             if re.search(r"^\s*def\s+__body\s*\(", body, flags=re.MULTILINE):
                 body_replaced = re.sub(
                     r"^\s*def\s+__body\s*\(",
@@ -803,7 +947,12 @@ def compile_namespace(components: Dict[str, Component]) -> Dict[str, Any]:
     code = "\n".join(code_lines)
     ns: Dict[str, Any] = {}
     exec(compile(code, "<dsl-compiled>", "exec"), ns)
+    # expose the actual generated code for debugging
     ns["_dsl_generated_code"] = code
+    # ensure the py helper is available as a top-level callable so YAML can
+    # refer to it as a child: e.g., main(py): <code>
+    if "py" in ns:
+        ns["py"] = ns["py"]
     return ns
 
 

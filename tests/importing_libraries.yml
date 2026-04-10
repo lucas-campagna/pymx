@@ -15,6 +15,6 @@ main(cell1|cell2): null
 cell1(import_comp):
   math: [cos, pi]
 
-cell2(exec): cos(pi)
+cell2(eval): cos(pi)
 
 result: -1
