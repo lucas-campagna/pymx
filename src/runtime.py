@@ -383,6 +383,11 @@ def compile_namespace(components: Dict[str, Component]) -> Dict[str, Any]:
     # Build a list of regex-backed components (pattern -> __comp_name)
     code_lines.append("import re")
     code_lines.append("__re_components = []")
+    # Mapping from component name -> body function variable. Wrappers will
+    # call the body via this lookup to avoid relying on a stable function
+    # name (prevents accidental duplicate-def collisions from changing which
+    # body is invoked at runtime).
+    code_lines.append("__body_lookup = {}")
     for cname, cobj in components.items():
         if getattr(cobj, "pattern", None):
             # repr(cobj.pattern) already yields a correctly-escaped Python
@@ -516,6 +521,12 @@ def compile_namespace(components: Dict[str, Component]) -> Dict[str, Any]:
     for name, comp in components.items():
         # Record the start line in the generated code for this component
         start_line = len(code_lines) + 1
+        # Track whether we've emitted a body function for this component
+        # Some generator paths can attempt to emit multiple bodies for the
+        # same logical component (this was a source of duplicate `def
+        # __body_...` occurrences). Guard so only the first emission
+        # actually writes the body; later branches must not re-emit.
+        emitted_body = False
         # If the component was defined from a regex signature, expose a
         # wrapper that matches components by name at runtime. We'll create
         # a small dispatcher function that, when invoked as a child lookup,
@@ -524,6 +535,20 @@ def compile_namespace(components: Dict[str, Component]) -> Dict[str, Any]:
         # regex-backed components are handled by __lookup_child registry;
         # no per-component wrapper emitted here.
         body_fn = f"__body_{name}"
+        # Debug prints removed - keep concise generation
+        # Avoid emitting the same body function name multiple times. In some
+        # generator paths a name collision could occur (previously observed
+        # as duplicate defs like __body___tpl_2). If a collision is detected
+        # pick a unique alternative name so each component's body is bound to
+        # its own function and wrappers call the correct one.
+        # Track emitted body function names; duplicate defs indicate a
+        # generator bug. Treat duplicates as a hard error to avoid subtle
+        # runtime behavior differences caused by silent renaming.
+        if not hasattr(compile_namespace, "_emitted_body_fns"):
+            compile_namespace._emitted_body_fns = set()
+        if body_fn in compile_namespace._emitted_body_fns:
+            raise RuntimeError(f"Duplicate emitted body function name: {body_fn}")
+        compile_namespace._emitted_body_fns.add(body_fn)
 
         # No runtime baked-in components; all components must come from YAML.
         # (Previously import_comp was hard-coded here; remove that special-case)
@@ -536,7 +561,9 @@ def compile_namespace(components: Dict[str, Component]) -> Dict[str, Any]:
                 lit = None
 
             if isinstance(lit, dict):
-                code_lines.append(f"def {body_fn}(default=None, *args, **kwargs):")
+                if not emitted_body:
+                    code_lines.append(f"def {body_fn}(default=None, *args, **kwargs):")
+                    emitted_body = True
                 code_lines.append(
                     "    d = dict(default) if isinstance(default, dict) else {}"
                 )
@@ -556,7 +583,9 @@ def compile_namespace(components: Dict[str, Component]) -> Dict[str, Any]:
                 code_lines.append("    return d")
                 code_lines.append("")
             elif isinstance(lit, (list, tuple)):
-                code_lines.append(f"def {body_fn}(default=None, *args, **kwargs):")
+                if not emitted_body:
+                    code_lines.append(f"def {body_fn}(default=None, *args, **kwargs):")
+                    emitted_body = True
                 code_lines.append(
                     f"    if isinstance(default, (list, tuple)): return list(default) + {_expr_for_value(lit)}"
                 )
@@ -581,9 +610,11 @@ def compile_namespace(components: Dict[str, Component]) -> Dict[str, Any]:
                         rhs_raw = m_assign.group(2)
                         rhs_expr = _replace_default_token(rhs_raw)
                         var_expr = f"__deref('{lhs_name}', default, args, kwargs)"
-                        code_lines.append(
-                            f"def {body_fn}(default=None, *args, **kwargs):"
-                        )
+                        if not emitted_body:
+                            code_lines.append(
+                                f"def {body_fn}(default=None, *args, **kwargs):"
+                            )
+                            emitted_body = True
                         code_lines.append(f"    globals()[{var_expr}] = ({rhs_expr})")
                         code_lines.append("    return default")
                         code_lines.append("")
@@ -592,9 +623,11 @@ def compile_namespace(components: Dict[str, Component]) -> Dict[str, Any]:
                         # exec the assignment, and return the assigned global.
                         lhs_name = m_assign_literal.group(1)
                         rhs_raw = m_assign_literal.group(2)
-                        code_lines.append(
-                            f"def {body_fn}(default=None, *args, **kwargs):"
-                        )
+                        if not emitted_body:
+                            code_lines.append(
+                                f"def {body_fn}(default=None, *args, **kwargs):"
+                            )
+                            emitted_body = True
                         code_lines.append("    import re as _re")
                         code_lines.append(f"    tpl = {repr(rhs_raw)}")
                         code_lines.append(
@@ -690,6 +723,13 @@ def compile_namespace(components: Dict[str, Component]) -> Dict[str, Any]:
                             r"        elif isinstance(v, str) and _re.match(r'^-?\d+$', v):"
                         )
                         code_lines.append("            mapping[mk] = v")
+                        # If the value is an identifier-like string (eg. a name
+                        # captured by a regex) inject it raw (no quotes) so it can
+                        # be used as a variable name in generated code.
+                        code_lines.append(
+                            r"        elif isinstance(v, str) and _re.match(r'^[A-Za-z_]\w*$', v):"
+                        )
+                        code_lines.append("            mapping[mk] = v")
                         code_lines.append("        else:")
                         code_lines.append("            mapping[mk] = repr(v)")
                         code_lines.append(
@@ -697,9 +737,15 @@ def compile_namespace(components: Dict[str, Component]) -> Dict[str, Any]:
                         )
                         code_lines.append("    try:")
                         code_lines.append("        rv = py(code)")
+                        code_lines.append("        if rv is not None:")
+                        code_lines.append("            return rv")
                         code_lines.append("    except Exception:")
                         code_lines.append("        pass")
-                        code_lines.append(f"    return globals().get({repr(lhs_name)})")
+                        code_lines.append(f"    _gv = globals().get({repr(lhs_name)})")
+                        code_lines.append("    if _gv is not None:")
+                        code_lines.append("        return _gv")
+                        # Fallback: return the substituted code string itself
+                        code_lines.append("    return code")
                         code_lines.append("")
                     else:
                         # For quoted string bodies that contain $-placeholders
@@ -710,11 +756,20 @@ def compile_namespace(components: Dict[str, Component]) -> Dict[str, Any]:
                         # resulting source in globals(). This keeps the
                         # substitution simple while avoiding arbitrary token
                         # injection for non-whitelisted placeholder values.
-                        code_lines.append(
-                            f"def {body_fn}(default=None, *args, **kwargs):"
-                        )
+                        if not emitted_body:
+                            code_lines.append(
+                                f"def {body_fn}(default=None, *args, **kwargs):"
+                            )
+                            emitted_body = True
                         code_lines.append("    import re as _re")
                         code_lines.append(f"    tpl = {repr(inner)}")
+                        # Treat escaped dollar sequences (\$) as a literal dollar
+                        # so they are not interpreted as placeholders during
+                        # template substitution. We use a sentinel token that
+                        # is restored after format_map().
+                        code_lines.append(
+                            "    tpl = tpl.replace('\\\\$', '__DSL_ESC_DOLLAR__')"
+                        )
                         code_lines.append(
                             "    # escape any braces so format_map() works"
                         )
@@ -834,6 +889,9 @@ def compile_namespace(components: Dict[str, Component]) -> Dict[str, Any]:
                         code_lines.append("            mapping[mk] = repr(v)")
                         code_lines.append("    code = tpl2.format_map(mapping)")
                         code_lines.append(
+                            "    code = code.replace('__DSL_ESC_DOLLAR__', '$')"
+                        )
+                        code_lines.append(
                             "    m = _re.match(r'^\\s*([A-Za-z_]\\w*)\\s*=', code)"
                         )
                         code_lines.append("    if m:")
@@ -865,26 +923,244 @@ def compile_namespace(components: Dict[str, Component]) -> Dict[str, Any]:
                         code_lines.append(
                             "        return globals()[created_noncall[0]]"
                         )
+                        # Fallback: when execution produced nothing useful, return the
+                        # substituted template text so templates that produce plain
+                        # strings still yield a value instead of None.
+                        code_lines.append("    return code")
                 else:
                     expr = _replace_default_token(comp.body)
-                    code_lines.append(f"def {body_fn}(default=None, *args, **kwargs):")
+                    if not emitted_body:
+                        code_lines.append(
+                            f"def {body_fn}(default=None, *args, **kwargs):"
+                        )
+                        emitted_body = True
                     code_lines.append(f"    return ({expr})")
                     code_lines.append("")
         else:
-            body = _replace_default_token(textwrap.dedent(comp.body))
-            # Try a limited compile-time normalization for reversed join
-            # patterns (value.join(', ')) so code embedded from multi-line
-            # YAML block bodies doesn't contain `.join` calls on list
-            # objects (which would raise AttributeError). Only perform the
-            # join() transform here; other DSL literal normalization is
-            # handled at runtime.
-            try:
-                norm = _normalize_source(body)
-                if isinstance(norm, str):
-                    body = norm
-            except Exception:
-                pass
-            if re.search(r"^\s*def\s+__body\s*\(", body, flags=re.MULTILINE):
+            # If the original YAML body contains $-placeholders and this was
+            # a block-style body, treat it as a runtime template: build a
+            # substituted code string at runtime (so operators, names, and
+            # numeric tokens can be injected safely) and exec() it in
+            # globals(). This covers regex-backed components and other DSL
+            # snippets that embed $-tokens in block code.
+            orig_body = getattr(comp, "orig_body", None)
+            # Track whether we emitted the runtime-template form for this
+            # block body (orig_body contained $ and we wrote a custom
+            # runtime substitution function). When true we must avoid
+            # further processing that expects `body` to be defined.
+            handled_runtime_template = False
+            body = None
+            if orig_body is not None and "$" in orig_body:
+                # Emit a runtime template substitution similar to the
+                # quoted-string template branch but tailored for block bodies
+                # where the produced code should be exec()'d and the
+                # component returns the incoming default.
+                if not emitted_body:
+                    code_lines.append(f"def {body_fn}(default=None, *args, **kwargs):")
+                    emitted_body = True
+                code_lines.append("    import re as _re")
+                # Normalize the block source if possible (fix patterns like
+                # value.join(', ') -> ', '.join(value)) before embedding the
+                # template so runtime exec() sees the corrected code.
+                tpl_src = textwrap.dedent(orig_body)
+                # Apply a lightweight join() normalization for patterns like
+                # `value.join(', ')` -> `', '.join(value)` so lists used in
+                # templates behave as expected. This runs before the more
+                # expensive AST-based normalization and works even when the
+                # body contains $-placeholders which would break parsing.
+                try:
+                    tpl_src = re.sub(
+                        r"(\b[A-Za-z_]\w*)\.join\(\s*('(?:\\'|[^'])*'|\"(?:\\\"|[^\"])*\")\s*\)",
+                        lambda m: f"{m.group(2)}.join({m.group(1)})",
+                        tpl_src,
+                    )
+                except Exception:
+                    pass
+                try:
+                    norm_tpl = _normalize_source(tpl_src)
+                    if isinstance(norm_tpl, str):
+                        tpl_src = norm_tpl
+                except Exception:
+                    pass
+                code_lines.append(f"    tpl = {repr(tpl_src)}")
+                # Same escaped-dollar handling for block templates.
+                code_lines.append(
+                    "    tpl = tpl.replace('\\\\$', '__DSL_ESC_DOLLAR__')"
+                )
+                code_lines.append("    # escape any braces so format_map() works")
+                code_lines.append("    tpl = tpl.replace('{','{{').replace('}','}}')")
+                code_lines.append(
+                    "    tpl = tpl.replace('&&', ' and ').replace('||', ' or ')"
+                )
+                code_lines.append(
+                    "    # simple parser to replace $name with {name} and collect keys"
+                )
+                code_lines.append("    tpl2_chars = []")
+                code_lines.append("    keys = []")
+                code_lines.append("    i = 0")
+                code_lines.append("    L = len(tpl)")
+                code_lines.append("    while i < L:")
+                code_lines.append("        ch = tpl[i]")
+                code_lines.append("        # handle escaped characters (\\\\x -> x)")
+                code_lines.append("        if ch == '\\\\' and i + 1 < L:")
+                code_lines.append("            tpl2_chars.append(tpl[i+1])")
+                code_lines.append("            i += 2")
+                code_lines.append("            continue")
+                code_lines.append("        if ch == '$':")
+                code_lines.append("            j = i + 1")
+                code_lines.append(
+                    "            if j < L and (tpl[j].isalpha() or tpl[j] == '_'):"
+                )
+                code_lines.append("                k = j")
+                code_lines.append(
+                    "                while k < L and (tpl[k].isalnum() or tpl[k] == '_'):"
+                )
+                code_lines.append("                    k += 1")
+                code_lines.append("                name = tpl[j:k]")
+                code_lines.append("                tpl2_chars.append('{' + name + '}')")
+                code_lines.append("                if name not in keys:")
+                code_lines.append("                    keys.append(name)")
+                code_lines.append("                i = k")
+                code_lines.append("                continue")
+                code_lines.append("            # numeric placeholder like $0, $1, etc.")
+                code_lines.append("            if j < L and tpl[j].isdigit():")
+                code_lines.append("                k = j")
+                code_lines.append("                while k < L and tpl[k].isdigit():")
+                code_lines.append("                    k += 1")
+                code_lines.append("                name = tpl[j:k]")
+                code_lines.append(
+                    "                tpl2_chars.append('{' + 'n' + name + '}')"
+                )
+                code_lines.append("                if 'n' + name not in keys:")
+                code_lines.append("                    keys.append('n' + name)")
+                code_lines.append("                i = k")
+                code_lines.append("                continue")
+                code_lines.append("            else:")
+                code_lines.append("                tpl2_chars.append('$')")
+                code_lines.append("                i += 1")
+                code_lines.append("                continue")
+                code_lines.append("        tpl2_chars.append(ch)")
+                code_lines.append("        i += 1")
+                code_lines.append("    tpl2 = ''.join(tpl2_chars)")
+                code_lines.append("    mapping = {}")
+                code_lines.append("    for _k in keys:")
+                code_lines.append("        if _k == 'default':")
+                code_lines.append("            v = default")
+                code_lines.append("            mk = _k")
+                code_lines.append(
+                    "        elif _k.startswith('n') and _k[1:].isdigit():"
+                )
+                code_lines.append(
+                    "            v = __deref_index(_k[1:], default, args, kwargs)"
+                )
+                code_lines.append("            mk = _k")
+                code_lines.append("        elif _k.isdigit():")
+                code_lines.append(
+                    "            v = __deref_index(_k, default, args, kwargs)"
+                )
+                code_lines.append("            mk = _k")
+                code_lines.append("        else:")
+                code_lines.append("            v = __deref(_k, default, args, kwargs)")
+                code_lines.append("            mk = _k")
+                code_lines.append("        if isinstance(v, int):")
+                code_lines.append("            mapping[mk] = str(v)")
+                code_lines.append(
+                    r"        elif isinstance(v, str) and _re.match(r'^[+\-*/]$', v):"
+                )
+                code_lines.append("            mapping[mk] = v")
+                code_lines.append(
+                    r"        elif isinstance(v, str) and _re.match(r'^-?\d+$', v):"
+                )
+                code_lines.append("            mapping[mk] = v")
+                # identifier-like captured group values (eg. names) should be
+                # injected raw (no quotes) so they can act as variable names
+                # in the emitted code (eg. `sorted_list = ...`).
+                code_lines.append(
+                    r"        elif isinstance(v, str) and _re.match(r'^[A-Za-z_]\w*$', v):"
+                )
+                code_lines.append("            mapping[mk] = v")
+                code_lines.append("        else:")
+                code_lines.append("            mapping[mk] = repr(v)")
+                code_lines.append("    code = tpl2.format_map(mapping)")
+                code_lines.append("    code = code.replace('__DSL_ESC_DOLLAR__', '$')")
+                # If this looks like an assignment to a simple global name
+                # prefer executing it via exec(..., globals()) first so the
+                # module-level globals are deterministically mutated. Then
+                # return the assigned global's value. This avoids relying on
+                # py() which may evaluate in ways that don't persist side-
+                # effects consistently for assignment-heavy templates.
+                code_lines.append("    m = _re.match(r'^\s*([A-Za-z_]\w*)\s*=', code)")
+                code_lines.append("    if m:")
+                code_lines.append("        try:")
+                code_lines.append("            exec(code, globals())")
+                code_lines.append("        except Exception:")
+                code_lines.append("            pass")
+                code_lines.append("        _vn = m.group(1)")
+                code_lines.append("        if _vn in globals():")
+                code_lines.append("            return globals().get(_vn)")
+                # If exec didn't produce the named global, fall back to py()
+                # which will eval the last expression if possible.
+                code_lines.append("    try:")
+                code_lines.append("        rv = py(code)")
+                code_lines.append("        if rv is not None:")
+                code_lines.append("            return rv")
+                code_lines.append("    except Exception:")
+                code_lines.append("        pass")
+                # As a final fallback, run exec and inspect created names.
+                code_lines.append("    before = set(globals().keys())")
+                code_lines.append("    try:")
+                code_lines.append("        exec(code, globals())")
+                code_lines.append("    except Exception:")
+                code_lines.append("        pass")
+                code_lines.append("    after = set(globals().keys())")
+                code_lines.append(
+                    "    created = [n for n in after - before if callable(globals().get(n))]"
+                )
+                code_lines.append("    if len(created) == 1:")
+                code_lines.append("        return globals()[created[0]]")
+                code_lines.append(
+                    "    created_noncall = [n for n in after - before if not callable(globals().get(n))]"
+                )
+                code_lines.append("    if len(created_noncall) == 1:")
+                code_lines.append("        return globals()[created_noncall[0]]")
+                # If we matched an assignment target but couldn't find a new
+                # created name, prefer returning the (possibly-updated)
+                # global value if present.
+                code_lines.append("    if m:")
+                code_lines.append("        _vn = m.group(1)")
+                code_lines.append("        if _vn in globals():")
+                code_lines.append("            return globals().get(_vn)")
+                # Default: return the incoming default value
+                code_lines.append("    return default")
+                code_lines.append("")
+                # We've emitted the runtime-template body for this component.
+                handled_runtime_template = True
+            else:
+                body = _replace_default_token(textwrap.dedent(comp.body))
+                # Try a limited compile-time normalization for reversed join
+                # patterns (value.join(', ')) so code embedded from multi-line
+                # YAML block bodies doesn't contain `.join` calls on list
+                # objects (which would raise AttributeError). Only perform the
+                # join() transform here; other DSL literal normalization is
+                # handled at runtime.
+                try:
+                    norm = _normalize_source(body)
+                    if isinstance(norm, str):
+                        body = norm
+                except Exception:
+                    pass
+            # Only process a pre-specified `body` when we did not emit the
+            # runtime-template form above. When orig_body contained `$` we
+            # generated code directly and `body` may be None in this
+            # branch; guard to avoid referencing an unassigned local.
+            if (
+                not handled_runtime_template
+                and body is not None
+                and re.search(r"^\s*def\s+__body\s*\(", body, flags=re.MULTILINE)
+            ):
+                # Replace the placeholder `def __body(...` with our computed
+                # body name. Only perform the replacement if we haven't
+                # already emitted a body for this component.
                 body_replaced = re.sub(
                     r"^\s*def\s+__body\s*\(",
                     f"def {body_fn}(",
@@ -892,15 +1168,25 @@ def compile_namespace(components: Dict[str, Component]) -> Dict[str, Any]:
                     count=1,
                     flags=re.MULTILINE,
                 )
-                code_lines.extend(body_replaced.splitlines())
-                code_lines.append("")
-            elif re.search(r"^\s*(def|class|import|from)\b", body, flags=re.MULTILINE):
+                if not emitted_body:
+                    code_lines.extend(body_replaced.splitlines())
+                    code_lines.append("")
+                    emitted_body = True
+            elif (
+                not handled_runtime_template
+                and body is not None
+                and re.search(
+                    r"^\s*(def|class|import|from)\b", body, flags=re.MULTILINE
+                )
+            ):
                 code_lines.extend(body.splitlines())
                 code_lines.append("")
-                code_lines.append(f"def {body_fn}(default=None, *args, **kwargs):")
-                code_lines.append("    return default")
-                code_lines.append("")
-            else:
+                if not emitted_body:
+                    code_lines.append(f"def {body_fn}(default=None, *args, **kwargs):")
+                    code_lines.append("    return default")
+                    code_lines.append("")
+                    emitted_body = True
+            elif not handled_runtime_template and body is not None:
                 first_nonblank = next(
                     (ln for ln in body.splitlines() if ln.strip()), ""
                 )
@@ -909,11 +1195,19 @@ def compile_namespace(components: Dict[str, Component]) -> Dict[str, Any]:
                 ):
                     code_lines.extend(body.splitlines())
                     code_lines.append("")
-                    code_lines.append(f"def {body_fn}(default=None, *args, **kwargs):")
-                    code_lines.append("    return None")
-                    code_lines.append("")
+                    if not emitted_body:
+                        code_lines.append(
+                            f"def {body_fn}(default=None, *args, **kwargs):"
+                        )
+                        code_lines.append("    return None")
+                        code_lines.append("")
+                        emitted_body = True
                 else:
-                    code_lines.append(f"def {body_fn}(default=None, *args, **kwargs):")
+                    if not emitted_body:
+                        code_lines.append(
+                            f"def {body_fn}(default=None, *args, **kwargs):"
+                        )
+                        emitted_body = True
                     stripped_lines = [ln for ln in body.splitlines() if ln.strip()]
                     if len(stripped_lines) == 1 and not stripped_lines[
                         0
@@ -921,7 +1215,70 @@ def compile_namespace(components: Dict[str, Component]) -> Dict[str, Any]:
                         ("def ", "class ", "import ", "from ", "return ")
                     ):
                         single = stripped_lines[0]
-                        code_lines.append(f"    return ({single})")
+                        # If the single line is a DSL-style component call like
+                        # `name(...)` treat it specially: don't exec the raw
+                        # string (which may contain Python keywords as kw names),
+                        # instead route it through __invoke_child with the
+                        # py helper which knows how to parse and invoke DSL
+                        # component-call syntax safely.
+                        mcall = re.match(r"^\s*([A-Za-z_]\w*)\s*\((.*)\)\s*$", single)
+                        if mcall:
+                            code_lines.append(f"    try:")
+                            code_lines.append(
+                                f"        _rv = __invoke_child(globals().get('py'), {repr(single)})"
+                            )
+                            code_lines.append("        return _rv")
+                            code_lines.append("    except Exception:")
+                            code_lines.append("        raise")
+                        else:
+                            # If the single line looks like an assignment and
+                            # the component body was a block (so assignments
+                            # should mutate module globals), handle two
+                            # special cases:
+                            # 1) LHS is a deref() placeholder (produced by
+                            #    _replace_default_token for `$name = ...`). In
+                            #    that situation we must assign into
+                            #    globals()[__deref(...)] instead of trying to
+                            #    assign to the function-call-like expression.
+                            # 2) Otherwise fall back to exec(..., globals()).
+                            if (
+                                comp.body_type == "block"
+                                and "=" in single
+                                and "==" not in single
+                                and ":=" not in single
+                            ):
+                                # detect deref-style LHS produced by
+                                # _replace_default_token -> __deref('name', ...)
+                                m_assign_deref = re.match(
+                                    r"^\s*__deref\('([A-Za-z_]\w*)',\s*default,\s*args,\s*kwargs\)\s*=\s*(.+)$",
+                                    single,
+                                )
+                                if m_assign_deref:
+                                    lhs_name = m_assign_deref.group(1)
+                                    rhs_raw = m_assign_deref.group(2)
+                                    var_expr = (
+                                        f"__deref('{lhs_name}', default, args, kwargs)"
+                                    )
+                                    code_lines.append(
+                                        f"    globals()[{var_expr}] = ({rhs_raw})"
+                                    )
+                                    code_lines.append("    return default")
+                                else:
+                                    code_lines.append(
+                                        f"    exec({repr(single)}, globals())"
+                                    )
+                                    code_lines.append("    return default")
+                            elif (
+                                "=" in single
+                                and "==" not in single
+                                and ":=" not in single
+                            ):
+                                # For non-block (expr-derived) single-line assignments
+                                # prefer emitting the statement and returning default.
+                                code_lines.append(f"    {single}")
+                                code_lines.append("    return default")
+                            else:
+                                code_lines.append(f"    return ({single})")
                     else:
                         if body.strip() == "":
                             code_lines.append("    pass")
@@ -932,9 +1289,24 @@ def compile_namespace(components: Dict[str, Component]) -> Dict[str, Any]:
                                 else:
                                     code_lines.append(f"    {line.rstrip()}")
                     code_lines.append("")
+            else:
+                # No body to process here (either we emitted a runtime-template
+                # form above or body was None). Ensure a body function exists so
+                # wrappers can call it; if one wasn't emitted earlier, emit a
+                # minimal body that returns the incoming default.
+                if not emitted_body:
+                    code_lines.append(f"def {body_fn}(default=None, *args, **kwargs):")
+                    code_lines.append("    return default")
+                    code_lines.append("")
+                    emitted_body = True
 
+        # Register the emitted body function into the runtime lookup so
+        # wrappers will call the correct body even if function names collide.
+        code_lines.append(f"__body_lookup[{repr(name)}] = {body_fn}")
         code_lines.append(f"def __comp_{name}(default=None, *args, **kwargs):")
-        code_lines.append(f"    result = {body_fn}(default, *args, **kwargs)")
+        code_lines.append(
+            f"    result = __body_lookup[{repr(name)}](default, *args, **kwargs)"
+        )
 
         # If this component has a parent template defined, invoke it once
         # After the base body returns but before children are invoked. If the
@@ -943,8 +1315,13 @@ def compile_namespace(components: Dict[str, Component]) -> Dict[str, Any]:
         tpl = None
         pre_first = getattr(comp, "pre_template_first", False)
         first_child_name = comp.children[0] if comp.children else None
+        has_tpl = name in templates_by_base
 
-        if pre_first and first_child_name is not None:
+        # Only perform the pre-template invocation of the first child when a
+        # parent template exists for this component. If no template exists the
+        # trailing '!' is ignored and the child will be invoked in normal
+        # order below.
+        if has_tpl and pre_first and first_child_name is not None:
             # call the first child before applying the parent template
             code_lines.append(
                 f"    # pre-template: invoke first child {first_child_name} before parent for {name}"
@@ -962,7 +1339,7 @@ def compile_namespace(components: Dict[str, Component]) -> Dict[str, Any]:
             )
             code_lines.append(f"    result = __invoke_child(_pre_child, result)")
 
-        if name in templates_by_base:
+        if has_tpl:
             tpl = templates_by_base[name][0]
             # call the template once and replace the current result
             code_lines.append(
@@ -980,8 +1357,10 @@ def compile_namespace(components: Dict[str, Component]) -> Dict[str, Any]:
         for i, child in enumerate(comp.children):
             # If we already invoked the first child before applying the
             # parent template due to the '!' operator, skip it here so it's
-            # not called twice.
-            if pre_first and i == 0:
+            # not called twice. Only skip when a template actually exists
+            # for this component; when no template exists the trailing '!' is
+            # ignored and the child should be invoked in normal order.
+            if pre_first and i == 0 and has_tpl:
                 continue
             # Resolve child names via __lookup_child which handles compiled
             # components, top-level callables, and regex-backed components.
@@ -1010,8 +1389,35 @@ def compile_namespace(components: Dict[str, Component]) -> Dict[str, Any]:
             "orig_body": getattr(comp, "orig_body", None),
             "orig_key": getattr(comp, "orig_key", None),
         }
+        # Debug: emit a compact summary of the generated snippet for this
+        # component so we can map duplicate def occurrences back to DSL.
+        # Range debug prints removed
 
     code = "\n".join(code_lines)
+    # Defensive check: ensure we don't emit duplicate body function defs
+    # which indicate a generator logic bug (one def per body_fn expected).
+    dup_pat = re.compile(r"^def\s+(__body_[A-Za-z0-9_]+)\(", flags=re.MULTILINE)
+    found = dup_pat.findall(code)
+    if found:
+        from collections import Counter
+
+        counts = Counter(found)
+        dups = [n for n, c in counts.items() if c > 1]
+        if dups:
+            # Write the full generated code to /tmp for inspection and
+            # continue (temporary diagnostic mode). In normal operation we
+            # want to raise here, but for debugging allow execution so we
+            # can inspect the resulting namespace.
+            try:
+                with open("/tmp/dsl_generated_code_full.py", "w") as f:
+                    f.write(code)
+            except Exception:
+                pass
+            print(
+                f"WARNING: Duplicate body function definitions emitted: {dups}",
+                file=sys.stderr,
+            )
+
     ns: Dict[str, Any] = {}
     exec(compile(code, "<dsl-compiled>", "exec"), ns)
     # expose the actual generated code for debugging

@@ -215,4 +215,29 @@ def parse_components(
         # Best-effort only; don't fail parsing on extraction errors
         pass
 
+    # Post-process: if a component was parsed as a single-line scalar (expr)
+    # but the original YAML body (orig_body) appears to be unquoted code
+    # (for example an assignment like `x = ''` or `x += '...'`), treat it
+    # as a block body so the compiler will emit it as executable code
+    # rather than a string literal. This is a conservative heuristic to
+    # preserve intended DSL behavior in test fixtures that use unquoted
+    # single-line Python-like statements.
+    for comp in comps.values():
+        try:
+            if comp.body_type == "expr" and comp.orig_body is not None:
+                s = comp.orig_body.lstrip()
+                # If the original text was not quoted and looks like an
+                # assignment or contains a standalone Python statement, treat
+                # it as a block. We check for leading quote to avoid turning
+                # explicitly quoted strings into code.
+                if not (s.startswith("'") or s.startswith('"')) and (
+                    "=" in s
+                    or s.startswith(("def ", "class ", "import ", "from ", "return "))
+                ):
+                    comp.body_type = "block"
+                    comp.body = comp.orig_body
+        except Exception:
+            # best-effort only
+            pass
+
     return comps

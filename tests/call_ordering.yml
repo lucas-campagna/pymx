@@ -1,0 +1,11 @@
+main(py!|a|show): x=''
+a(py!|e): x+='a'
+$a(py|b): x+='-\$a'
+b(py!|c): x+='-b'
+$b(py): x+='-\$b'
+c(py|d): x+='-c'
+d(py): x+='-d'
+e(py): x+='-e'
+show(py): x
+
+result: a-\$a-b-\$b-c-d-e
